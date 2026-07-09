@@ -50,7 +50,6 @@ license: MIT
 
 from __future__ import annotations
 
-import asyncio
 import base64
 import json
 import os
@@ -59,10 +58,8 @@ import sys
 import traceback
 import unicodedata
 import uuid
-from datetime import datetime, timezone
 from io import BytesIO
 from typing import Any, Optional
-from urllib.parse import quote
 
 import httpx
 from pydantic import BaseModel, Field
@@ -92,19 +89,17 @@ except ImportError:
 # blocks once at module load so the renderers can stay terse.
 from docx import Document  # type: ignore
 from docx.document import Document as _DocxDocument  # type: ignore
-from docx.enum.section import WD_ORIENTATION, WD_SECTION  # type: ignore
+from docx.enum.section import WD_ORIENTATION  # type: ignore
 from docx.enum.style import WD_STYLE_TYPE  # type: ignore
 from docx.enum.table import WD_ALIGN_VERTICAL, WD_ROW_HEIGHT_RULE  # type: ignore
 from docx.enum.text import (  # type: ignore
     WD_ALIGN_PARAGRAPH,
     WD_BREAK,
-    WD_LINE_SPACING,
     WD_TAB_ALIGNMENT,
-    WD_TAB_LEADER,
 )
 from docx.oxml import OxmlElement  # type: ignore
 from docx.oxml.ns import qn  # type: ignore
-from docx.shared import Cm, Mm, Pt, RGBColor, Inches, Emu  # type: ignore
+from docx.shared import Mm, Pt, RGBColor, Emu  # type: ignore
 
 # Optional: OpenWebUI Files API integration (only available inside the
 # OpenWebUI runtime). When unavailable, the tool still works via a local
@@ -1919,7 +1914,6 @@ def _ensure_numbering_definitions(doc: _DocxDocument, accent_hex: str) -> dict[s
         numbering = doc.part.numbering_part.element  # type: ignore[attr-defined]
     except (AttributeError, KeyError, NotImplementedError):
         # Some python-docx versions auto-create on access via .numbering_part
-        from docx.oxml.numbering import CT_Numbering  # type: ignore
         from docx.parts.numbering import NumberingPart  # type: ignore
         numbering_part = NumberingPart.new()
         doc.part.relate_to(numbering_part, doc.part.numbering_part_relationship_type if False else "http://schemas.openxmlformats.org/officeDocument/2006/relationships/numbering")
@@ -4375,8 +4369,16 @@ class Tools:
         request=None,
         user_dict=None,
     ) -> tuple[str, Optional[str], Optional[str]]:
-        """Persist the DOCX. Returns (filename, download_url, error)."""
-        filename = f"{_human_filename(title)}.docx"
+        """Persist the DOCX. Returns (filename, download_url, error).
+
+        ``filename`` is the human-readable label shown in chat. The Files API
+        path uploads under that pretty name (it serves via a file id and sets
+        Content-Disposition, so spaces/accents are fine). The ``/cache/files``
+        fallback, however, is a plain static route that 500s on spaces or
+        non-ASCII characters — so there we store and link an **ASCII-safe**
+        slug while still showing the pretty label.
+        """
+        display_name = f"{_human_filename(title)}.docx"
 
         # --- Primary: OpenWebUI Files API (visible in UI Files panel) ---
         if _HAS_OWUI_FILES and request and user_dict:
@@ -4385,7 +4387,7 @@ class Tools:
                 if user_model:
                     upload = UploadFile(
                         file=BytesIO(docx_bytes),
-                        filename=filename,
+                        filename=display_name,
                         headers=Headers({
                             "content-type":
                                 "application/vnd.openxmlformats-officedocument."
@@ -4402,29 +4404,25 @@ class Tools:
                     if file_item:
                         file_id = getattr(file_item, "id", None)
                         if file_id:
-                            return filename, f"/api/v1/files/{file_id}/content", None
+                            return display_name, f"/api/v1/files/{file_id}/content", None
             except Exception:
                 traceback.print_exc()
 
-        # --- Fallback: cache/files (download only) ---
+        # --- Fallback: cache/files (download only, ASCII-safe path) ---
         export_dir = (self.valves.docx_export_dir or "").strip() or "/app/backend/data/cache/files"
         try:
             os.makedirs(export_dir, mode=0o775, exist_ok=True)
-            # Disambiguate on-disk name so same-titled docs don't overwrite,
-            # while keeping the human-readable base for the download.
-            stored = filename
+            # ASCII slug + short suffix: safe for the static route and unique
+            # enough that same-titled docs don't overwrite each other.
+            stored = f"{_slugify(title)}_{uuid.uuid4().hex[:6]}.docx"
             filepath = os.path.join(export_dir, stored)
-            if os.path.exists(filepath):
-                base = filename[:-5]
-                stored = f"{base} ({uuid.uuid4().hex[:4]}).docx"
-                filepath = os.path.join(export_dir, stored)
             with open(filepath, "wb") as fh:
                 fh.write(docx_bytes)
             if os.path.isfile(filepath) and os.path.getsize(filepath) > 0:
-                return filename, f"/cache/files/{quote(stored)}", None
+                return display_name, f"/cache/files/{stored}", None
         except Exception as exc:
-            return filename, None, str(exc)
-        return filename, None, "could not save file"
+            return display_name, None, str(exc)
+        return display_name, None, "could not save file"
 
     # ── Response helpers ─────────────────────────────────────────────────────
     @staticmethod
