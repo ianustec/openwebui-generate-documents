@@ -6,7 +6,7 @@ funding_url: https://github.com/ianustec
 description: Generate high-quality native Word (.docx) documents from Markdown or a JSON spec - cover pages, styled headings, tables, callouts, TOC, header/footer
 requirements: python-docx, Pillow, httpx, pydantic, lxml, markdown-it-py, mdit-py-plugins, PyYAML
 required_open_webui_version: 0.4.0
-version: 1.1.0
+version: 1.1.1
 license: MIT
 """
 
