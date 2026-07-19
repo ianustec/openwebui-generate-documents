@@ -1,5 +1,7 @@
 # Generate Documents — Native DOCX engine for Open WebUI
 
+> Part of **[NEURA Office](https://github.com/ianustec/neura-office)**: native Word, PowerPoint and Excel for Open WebUI.
+
 A [Open WebUI](https://github.com/open-webui/open-webui) **Tool** that generates
 **native Word (.docx)** documents from Markdown (with YAML frontmatter) or a JSON
 spec produced by the model. It doesn't export HTML or PDF: it builds the document
