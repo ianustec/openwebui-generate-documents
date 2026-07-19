@@ -32,6 +32,7 @@ fallback) and a clickable **download link** appears in the chat.
 - **Human-readable filename** derived from the title (e.g. `Q3 Board Report.docx`).
 - **Optional images** from Unsplash (with a key) or generated via Open WebUI.
 - **Single-file**: one self-contained `.py`, ready to paste into the Tools registry.
+- **Company letterhead**: set `letterhead: "Filename.docx"` (`.dotx` accepted). Resolved from chat attachments first, then from `/mnt/uploads` (and the Open WebUI upload dir). Header, footer and margins are kept; only the body is rewritten.
 
 ## Requirements
 
@@ -89,6 +90,30 @@ Operating margin expanded by ==6 pp==.
 ```
 
 See the full example in [`examples/report.md`](examples/report.md).
+
+### Company letterhead
+
+1. Attach a letterhead or sample `.docx` / `.dotx` in the chat, **or** place it under `/mnt/uploads`.
+2. Tell the model which file to use, or put it in the frontmatter:
+
+```markdown
+---
+template: blank
+letterhead: "Carta_Rossi.docx"
+title: "Quote Q3"
+---
+
+# Scope of work
+
+...
+```
+
+Aliases: `sample`, `base_docx`. Matching is by basename (exact, case-insensitive, or stem).
+Open WebUI uuid-prefixed upload names (`<uuid>_Filename.dotx`) are matched too.
+If the name is missing, the tool lists chat attachments and the files found in the scanned dirs.
+Do not use a programmatic `cover` together with a letterhead (it would fight the company header).
+
+See also [`examples/letterhead.md`](examples/letterhead.md).
 
 ### JSON (legacy, still supported)
 

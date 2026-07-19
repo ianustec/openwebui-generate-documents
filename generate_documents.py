@@ -6,7 +6,7 @@ funding_url: https://github.com/ianustec
 description: Generate high-quality native Word (.docx) documents from Markdown or a JSON spec - cover pages, styled headings, tables, callouts, TOC, header/footer
 requirements: python-docx, Pillow, httpx, pydantic, lxml, markdown-it-py, mdit-py-plugins, PyYAML
 required_open_webui_version: 0.4.0
-version: 1.1.1
+version: 1.2.0
 license: MIT
 """
 
@@ -58,6 +58,7 @@ import sys
 import traceback
 import unicodedata
 import uuid
+import zipfile
 from io import BytesIO
 from typing import Any, Optional
 
@@ -120,6 +121,7 @@ try:
     from open_webui.models.files import Files as _OwuiFiles  # type: ignore
     _HAS_OWUI_IMAGES = True
 except ImportError:
+    _OwuiFiles = None  # type: ignore[assignment]
     _HAS_OWUI_IMAGES = False
 
 # Optional storage abstraction so we can read raw bytes back regardless of
@@ -423,6 +425,320 @@ def _read_owui_file_bytes(file_id: str) -> Optional[bytes]:
                 os.remove(cached_path)
             except Exception:
                 pass
+
+
+_DOCX_EXTS = (".docx", ".dotx")
+
+
+def _is_docx_name(name: str) -> bool:
+    n = (name or "").lower().strip()
+    return any(n.endswith(ext) for ext in _DOCX_EXTS)
+
+
+def _file_entry_id_name(entry: Any) -> tuple[str, str]:
+    """Extract (file_id, filename) from a chat attachment metadata entry."""
+    if not isinstance(entry, dict):
+        return "", ""
+    nested = entry.get("file")
+    if isinstance(nested, dict):
+        fid = str(nested.get("id") or nested.get("file_id") or "").strip()
+        name = str(
+            nested.get("filename")
+            or nested.get("name")
+            or entry.get("name")
+            or entry.get("filename")
+            or ""
+        ).strip()
+        return fid, name
+    fid = str(entry.get("id") or entry.get("file_id") or "").strip()
+    name = str(entry.get("filename") or entry.get("name") or "").strip()
+    return fid, name
+
+
+def _enrich_filename_from_owui(file_id: str) -> str:
+    """Best-effort filename lookup via OpenWebUI Files model."""
+    if not file_id or not _HAS_OWUI_IMAGES or _OwuiFiles is None:
+        return ""
+    try:
+        row = _OwuiFiles.get_file_by_id(file_id)
+    except Exception:
+        return ""
+    if not row:
+        return ""
+    name = getattr(row, "filename", None) or getattr(row, "name", None) or ""
+    if not name:
+        meta = getattr(row, "meta", None) or {}
+        if isinstance(meta, dict):
+            name = meta.get("name") or meta.get("filename") or ""
+    return str(name or "").strip()
+
+
+def _chat_docx_files(
+    metadata: Any = None,
+    files: Any = None,
+) -> list[dict[str, str]]:
+    """List .docx/.dotx attachments from chat ``__files__`` / ``__metadata__``.
+
+    Returns ``[{"id": "...", "name": "..."}, ...]`` (deduped by id, order kept).
+    """
+    raw_list: list = []
+    if isinstance(files, list):
+        raw_list.extend(files)
+    if isinstance(metadata, dict):
+        mf = metadata.get("files")
+        if isinstance(mf, list):
+            raw_list.extend(mf)
+        # Some OpenWebUI builds nest chat files one level deeper.
+        nested_meta = metadata.get("__metadata__")
+        if isinstance(nested_meta, dict):
+            mf2 = nested_meta.get("files")
+            if isinstance(mf2, list):
+                raw_list.extend(mf2)
+
+    out: list[dict[str, str]] = []
+    seen: set[str] = set()
+    for entry in raw_list:
+        fid, name = _file_entry_id_name(entry)
+        if not fid or fid in seen:
+            continue
+        if not name:
+            name = _enrich_filename_from_owui(fid)
+        if not name or not _is_docx_name(name):
+            continue
+        seen.add(fid)
+        out.append({"id": fid, "name": name})
+    return out
+
+
+def _norm_docx_stem(name: str) -> str:
+    n = os.path.basename((name or "").strip())
+    lower = n.lower()
+    for ext in _DOCX_EXTS:
+        if lower.endswith(ext):
+            return n[: -len(ext)]
+    return n
+
+
+def _match_letterhead(
+    wanted: str,
+    candidates: list[dict[str, str]],
+) -> Optional[dict[str, str]]:
+    """Match a letterhead filename against chat docx attachments.
+
+    Order: exact basename → case-insensitive → stem (with/without .docx).
+    """
+    want = os.path.basename((wanted or "").strip())
+    if not want or not candidates:
+        return None
+    # 1) exact
+    for c in candidates:
+        if c.get("name") == want:
+            return c
+    # 2) case-insensitive full name
+    want_l = want.lower()
+    for c in candidates:
+        if (c.get("name") or "").lower() == want_l:
+            return c
+    # 3) stem (ignore extension on both sides)
+    want_stem = _norm_docx_stem(want).lower()
+    for c in candidates:
+        if _norm_docx_stem(c.get("name") or "").lower() == want_stem:
+            return c
+    return None
+
+
+def _default_letterhead_dirs() -> list[str]:
+    """Directories scanned for on-disk letterhead files.
+
+    Covers the code-interpreter mount (``/mnt/uploads``) and OpenWebUI's
+    server-side upload dir. ``UPLOAD_DIR`` env / package constant is included
+    when resolvable so the tool follows non-default deployments.
+    """
+    dirs: list[str] = ["/mnt/uploads"]
+    env_dir = os.environ.get("UPLOAD_DIR")
+    if env_dir:
+        dirs.append(env_dir)
+    try:  # OpenWebUI >=0.4 exposes UPLOAD_DIR as a package constant
+        from open_webui.config import UPLOAD_DIR as _OWUI_UPLOAD_DIR  # type: ignore
+
+        if _OWUI_UPLOAD_DIR:
+            dirs.append(str(_OWUI_UPLOAD_DIR))
+    except Exception:
+        pass
+    dirs.append("/app/backend/data/uploads")
+    # de-dupe, preserve order
+    seen: set[str] = set()
+    out: list[str] = []
+    for d in dirs:
+        if d and d not in seen:
+            seen.add(d)
+            out.append(d)
+    return out
+
+
+def _list_disk_docx(dirs: list[str]) -> list[dict[str, str]]:
+    """Return {id: <abs path>, name: <basename>} for .docx/.dotx under dirs.
+
+    OpenWebUI stores uploads as ``<uuid>_<original name>``; we keep the raw
+    on-disk basename so :func:`_match_letterhead` can match by stem/suffix.
+    """
+    out: list[dict[str, str]] = []
+    seen: set[str] = set()
+    for d in dirs or []:
+        try:
+            names = os.listdir(d)
+        except Exception:
+            continue
+        for n in sorted(names):
+            if not _is_docx_name(n):
+                continue
+            path = os.path.join(d, n)
+            if not os.path.isfile(path) or path in seen:
+                continue
+            seen.add(path)
+            out.append({"id": path, "name": n})
+    return out
+
+
+def _match_letterhead_disk(
+    wanted: str,
+    candidates: list[dict[str, str]],
+) -> Optional[dict[str, str]]:
+    """Match a letterhead against on-disk files.
+
+    Adds an OpenWebUI-aware pass on top of :func:`_match_letterhead`: uploads
+    are stored as ``<uuid>_<original>``, so also accept a candidate whose name
+    ends with ``_<wanted>`` or whose stem ends with the wanted stem.
+    """
+    exact = _match_letterhead(wanted, candidates)
+    if exact:
+        return exact
+    want = os.path.basename((wanted or "").strip())
+    if not want or not candidates:
+        return None
+    want_l = want.lower()
+    want_stem = _norm_docx_stem(want).lower()
+    for c in candidates:
+        name_l = (c.get("name") or "").lower()
+        if name_l.endswith("_" + want_l) or name_l.endswith(want_l):
+            return c
+    for c in candidates:
+        cand_stem = _norm_docx_stem(c.get("name") or "").lower()
+        if cand_stem.endswith("_" + want_stem) or cand_stem.endswith(want_stem):
+            return c
+    return None
+
+
+def _letterhead_missing_error(
+    wanted: str,
+    candidates: list[dict[str, str]],
+    disk_candidates: Optional[list[dict[str, str]]] = None,
+    dirs: Optional[list[str]] = None,
+) -> str:
+    attached = ", ".join(c.get("name") or c.get("id") for c in candidates) or "(none)"
+    msg = (
+        f'Letterhead file "{wanted}" not found. '
+        f"Attached .docx/.dotx: {attached}."
+    )
+    if dirs is not None:
+        on_disk = ", ".join(
+            c.get("name") or "" for c in (disk_candidates or [])
+        ) or "(none)"
+        msg += (
+            f" Searched dirs {', '.join(dirs)} — found: {on_disk}."
+            " Upload the .docx/.dotx to one of those dirs, or attach it in chat."
+        )
+    return msg
+
+
+def _clear_body(doc: _DocxDocument) -> None:
+    """Remove every body child except the trailing ``w:sectPr``.
+
+    Keeping ``sectPr`` preserves letterhead header/footer refs and page
+    geometry (same approach as ``openwebui_preventivo``).
+    """
+    body = doc.element.body
+    sect_pr = body.find(qn("w:sectPr"))
+    for child in list(body):
+        if child is not sect_pr:
+            body.remove(child)
+
+
+def _dotx_to_docx_bytes(data: bytes) -> bytes:
+    """Rewrite a .dotx package so python-docx accepts it as a .docx.
+
+    Word templates use content type ``…template.main+xml``; python-docx only
+    opens ``…document.main+xml``. We rewrite [Content_Types].xml in-memory.
+    """
+    src = zipfile.ZipFile(BytesIO(data), "r")
+    out_buf = BytesIO()
+    with zipfile.ZipFile(out_buf, "w", compression=zipfile.ZIP_DEFLATED) as dst:
+        for info in src.infolist():
+            payload = src.read(info.filename)
+            if info.filename == "[Content_Types].xml":
+                text = payload.decode("utf-8")
+                text = text.replace(
+                    "wordprocessingml.template.main+xml",
+                    "wordprocessingml.document.main+xml",
+                )
+                # Some templates also use Override PartName="/word/document.xml"
+                # with template ContentType — already covered by the replace.
+                payload = text.encode("utf-8")
+            dst.writestr(info, payload)
+    src.close()
+    return out_buf.getvalue()
+
+
+def _load_letterhead_doc(
+    file_id: Optional[str] = None,
+    *,
+    raw: Optional[bytes] = None,
+    path: Optional[str] = None,
+) -> _DocxDocument:
+    """Open a letterhead/sample .docx or .dotx from path, file id or raw bytes."""
+    data = raw
+    if data is None and path:
+        try:
+            with open(path, "rb") as fh:
+                data = fh.read()
+        except Exception as exc:
+            raise ValueError(f"could not read letterhead file at {path}: {exc}") from exc
+    if data is None:
+        if not file_id:
+            raise ValueError("letterhead file id is empty")
+        data = _read_owui_file_bytes(file_id)
+    if not data:
+        raise ValueError(
+            f"could not read letterhead file bytes"
+            + (f" (id={file_id})" if file_id else "")
+        )
+    if not data.startswith(b"PK"):
+        raise ValueError("letterhead file is not a valid .docx/.dotx (ZIP) package")
+    try:
+        return Document(BytesIO(data))
+    except ValueError as exc:
+        # .dotx templates are rejected by python-docx; convert content type.
+        msg = str(exc).lower()
+        if "template.main" in msg or "not a word file" in msg:
+            try:
+                converted = _dotx_to_docx_bytes(data)
+                return Document(BytesIO(converted))
+            except Exception as exc2:
+                raise ValueError(
+                    f"could not open letterhead template (.dotx): {exc2}"
+                ) from exc2
+        raise ValueError(f"could not open letterhead .docx: {exc}") from exc
+    except Exception as exc:
+        raise ValueError(f"could not open letterhead .docx: {exc}") from exc
+
+
+def _coalesce_letterhead_name(spec: dict) -> Optional[str]:
+    """Pick the first non-empty letterhead alias from the spec."""
+    for key in ("letterhead", "sample", "base_docx"):
+        val = spec.get(key)
+        if isinstance(val, str) and val.strip():
+            return val.strip()
+    return None
 
 
 async def _direct_image_generation(prompt: str, request: Any) -> Optional[bytes]:
@@ -1061,6 +1377,13 @@ def _resolve_template(spec: dict) -> dict:
         if alias:
             styles["accent"] = alias
     merged["styles"] = styles
+
+    # Coalesce letterhead aliases into a single string field.
+    lh = _coalesce_letterhead_name(merged)
+    if lh:
+        merged["letterhead"] = lh
+    else:
+        merged.pop("letterhead", None)
     return merged
 
 # endregion
@@ -1253,6 +1576,8 @@ _FRONTMATTER_KEYS = {
     # level). Keep these so `_resolve_template` can fold them into
     # ``styles.accent`` instead of silently dropping the brand color.
     "accent", "accent_color", "accent_hex",
+    # Company letterhead / sample .docx attached in chat (filename only).
+    "letterhead", "sample", "base_docx",
 }
 
 
@@ -1909,14 +2234,34 @@ def _ensure_numbering_definitions(doc: _DocxDocument, accent_hex: str) -> dict[s
     if cached:
         return cached
 
-    # Get or create the numbering part
+    # Get or create the numbering part. Many company .dotx/.docx templates
+    # omit numbering.xml; python-docx's NumberingPart.new() is a stub that
+    # raises NotImplementedError, so we build an empty part ourselves.
     try:
         numbering = doc.part.numbering_part.element  # type: ignore[attr-defined]
     except (AttributeError, KeyError, NotImplementedError):
-        # Some python-docx versions auto-create on access via .numbering_part
+        from docx.opc.constants import (  # type: ignore
+            CONTENT_TYPE as _CT,
+            RELATIONSHIP_TYPE as _RT,
+        )
+        from docx.opc.packuri import PackURI  # type: ignore
+        from docx.oxml.parser import parse_xml  # type: ignore
         from docx.parts.numbering import NumberingPart  # type: ignore
-        numbering_part = NumberingPart.new()
-        doc.part.relate_to(numbering_part, doc.part.numbering_part_relationship_type if False else "http://schemas.openxmlformats.org/officeDocument/2006/relationships/numbering")
+
+        numbering_elm = parse_xml(
+            b'<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+            b'<w:numbering xmlns:w="http://schemas.openxmlformats.org/'
+            b'wordprocessingml/2006/main" '
+            b'xmlns:r="http://schemas.openxmlformats.org/officeDocument/'
+            b'2006/relationships"/>'
+        )
+        numbering_part = NumberingPart(
+            PackURI("/word/numbering.xml"),
+            _CT.WML_NUMBERING,
+            numbering_elm,
+            doc.part.package,
+        )
+        doc.part.relate_to(numbering_part, _RT.NUMBERING)
         numbering = numbering_part.element
 
     nsmap = numbering.nsmap
@@ -2134,7 +2479,7 @@ def _set_run_tracking(run, twentieths: int) -> None:
         pass
 
 
-def _apply_styles(doc: _DocxDocument, styles: dict) -> None:
+def _apply_styles(doc: _DocxDocument, styles: dict, *, soft: bool = False) -> None:
     """Configure base fonts + heading sizes + colours from the design tokens.
 
     Sets:
@@ -2143,12 +2488,26 @@ def _apply_styles(doc: _DocxDocument, styles: dict) -> None:
         beneath section-level headings (H1/H2 by default)
       - A ``Caption`` and refined ``Quote`` look
       - Hyperlink style (so links look like links)
+
+    When ``soft=True`` (letterhead mode), leave Normal / Heading styles from
+    the company template untouched and only ensure Caption / Hyperlink exist.
     """
     theme = _theme(doc)
     font_name = styles.get("font") or theme["font"]
     base_size = int(styles.get("size_pt") or theme["size_pt"])
     heading_hex = theme["heading"]
     rule_hex = theme["rule_strong"]
+
+    if soft:
+        _ensure_caption_style(doc, font_name)
+        try:
+            link_style = doc.styles["Hyperlink"]
+            if not link_style.font.color.rgb:
+                link_style.font.color.rgb = _rgb(theme["accent"])
+            link_style.font.underline = True
+        except KeyError:
+            pass
+        return
 
     # Which section levels get the divider rule (overridable via styles).
     rule_levels = styles.get("heading_rule_levels")
@@ -4077,6 +4436,15 @@ class Tools:
                 "proposal, minutes."
             ),
         )
+        letterhead_dirs: str = Field(
+            default="",
+            description=(
+                "OPTIONAL comma-separated directories scanned for a `letterhead`"
+                " .docx/.dotx file when it is NOT attached in chat. Leave empty"
+                " to use sensible defaults (/mnt/uploads, OpenWebUI UPLOAD_DIR,"
+                " /app/backend/data/uploads)."
+            ),
+        )
 
     def __init__(self):
         self.valves = self.Valves()
@@ -4094,6 +4462,8 @@ class Tools:
         __event_emitter__=None,
         __request__=None,
         __user__=None,
+        __metadata__=None,
+        __files__=None,
     ) -> str:
         """Generate a Word (.docx) document from a structured spec.
 
@@ -4119,6 +4489,16 @@ class Tools:
                ::: callout type="success" title="Note"
                Body...
                :::
+
+           Company letterhead: set ``letterhead: "Filename.docx"`` (also
+           accepts .dotx; aliases ``sample``, ``base_docx``). The file is
+           resolved from the chat attachments first, then from the upload
+           directories (``/mnt/uploads`` and the OpenWebUI upload dir). So a
+           letterhead uploaded to the chat OR placed in /mnt/uploads works —
+           just pass its filename. Header/footer/margins of that file are
+           kept; only the body is rewritten. Do NOT read the letterhead with
+           execute_code/python-docx; call this tool with ``letterhead`` set.
+           Do not use a programmatic cover with a letterhead.
 
         2. **JSON** (legacy, fully supported): an object with the
            ``title/template/page/styles/header/footer/cover/blocks`` shape
@@ -4154,9 +4534,19 @@ class Tools:
 
         await self._emit_status(__event_emitter__, "Building Word document...", done=False)
 
+        cfg_dirs = [
+            d.strip()
+            for d in (self.valves.letterhead_dirs or "").split(",")
+            if d.strip()
+        ]
         try:
             doc = await self._build_document(
-                spec, request=__request__, user_dict=__user__
+                spec,
+                request=__request__,
+                user_dict=__user__,
+                metadata=__metadata__,
+                files=__files__,
+                letterhead_dirs=cfg_dirs or None,
             )
         except Exception as exc:
             traceback.print_exc()
@@ -4208,9 +4598,39 @@ class Tools:
         *,
         request: Any = None,
         user_dict: Optional[dict] = None,
+        metadata: Any = None,
+        files: Any = None,
+        letterhead_dirs: Optional[list[str]] = None,
     ) -> _DocxDocument:
         """Assemble the python-docx Document from the resolved spec."""
-        doc = Document()
+        letterhead_name = _coalesce_letterhead_name(spec)
+        use_letterhead = bool(letterhead_name)
+        letterhead_raw: Optional[bytes] = spec.get("_letterhead_bytes")  # tests
+
+        if use_letterhead:
+            if letterhead_raw is not None:
+                doc = _load_letterhead_doc(raw=letterhead_raw)
+            else:
+                # 1) chat attachments (Files API)
+                candidates = _chat_docx_files(metadata, files)
+                matched = _match_letterhead(letterhead_name, candidates)
+                if matched:
+                    doc = _load_letterhead_doc(matched["id"])
+                else:
+                    # 2) filesystem fallback (/mnt/uploads, OpenWebUI uploads)
+                    dirs = letterhead_dirs or _default_letterhead_dirs()
+                    disk = _list_disk_docx(dirs)
+                    matched_disk = _match_letterhead_disk(letterhead_name, disk)
+                    if not matched_disk:
+                        raise ValueError(
+                            _letterhead_missing_error(
+                                letterhead_name, candidates, disk, dirs
+                            )
+                        )
+                    doc = _load_letterhead_doc(path=matched_disk["id"])
+            _clear_body(doc)
+        else:
+            doc = Document()
 
         # Resolve the design-token palette ONCE and attach it to the doc so
         # every renderer reads colours/fonts from a single coherent source.
@@ -4226,8 +4646,18 @@ class Tools:
             _styles.get("numbered_headings_depth", 3) or 3
         )
 
-        _apply_page_setup(doc, spec.get("page") or {})
-        _apply_styles(doc, spec.get("styles") or {})
+        if use_letterhead:
+            # Keep company page setup + header/footer; only soft-ensure styles.
+            _apply_styles(doc, spec.get("styles") or {}, soft=True)
+            if spec.get("cover"):
+                print(
+                    "[documents] letterhead: ignoring cover (conflicts with "
+                    "company header/footer)",
+                    file=sys.stderr,
+                )
+        else:
+            _apply_page_setup(doc, spec.get("page") or {})
+            _apply_styles(doc, spec.get("styles") or {})
 
         accent_hex = theme["accent"]
         accent_rgb = _hex_to_rgb(accent_hex)
@@ -4247,62 +4677,63 @@ class Tools:
                 user_dict=user_dict,
             )
 
-        # Normalize header/footer: authors may pass a plain string (running
-        # text) or a dict ({text, logo, alignment, show_page_numbers, ...}).
-        # Downstream helpers expect a dict, so coerce strings here.
-        header_spec = spec.get("header") or None
-        if isinstance(header_spec, str):
-            header_spec = {"text": header_spec}
-        footer_spec = spec.get("footer") or None
-        if isinstance(footer_spec, str):
-            footer_spec = {"text": footer_spec}
+        if not use_letterhead:
+            # Normalize header/footer: authors may pass a plain string (running
+            # text) or a dict ({text, logo, alignment, show_page_numbers, ...}).
+            # Downstream helpers expect a dict, so coerce strings here.
+            header_spec = spec.get("header") or None
+            if isinstance(header_spec, str):
+                header_spec = {"text": header_spec}
+            footer_spec = spec.get("footer") or None
+            if isinstance(footer_spec, str):
+                footer_spec = {"text": footer_spec}
 
-        # Resolve an optional header logo (b64/url/hint) up front.
-        header_logo = None
-        if isinstance(header_spec, dict):
-            header_logo = await _cover_image(header_spec, "logo", _resolver)
+            # Resolve an optional header logo (b64/url/hint) up front.
+            header_logo = None
+            if isinstance(header_spec, dict):
+                header_logo = await _cover_image(header_spec, "logo", _resolver)
 
-        # Suppress the running header/footer on page 1 when a cover exists.
-        cover_present = bool(spec.get("cover"))
+            # Suppress the running header/footer on page 1 when a cover exists.
+            cover_present = bool(spec.get("cover"))
 
-        # Header / footer
-        _build_header_footer(
-            doc,
-            header_spec=header_spec,
-            footer_spec=footer_spec,
-            accent_hex=accent_hex,
-            header_logo=header_logo,
-            first_page_different=cover_present,
-        )
-
-        # Cover page (template "auto" cover OR explicit cover dict). In both
-        # cases we backfill missing fields from the top-level spec so authors
-        # can put title/subtitle/author/date in the frontmatter root and only
-        # use ``cover:`` for style/kicker overrides.
-        cover_spec = spec.get("cover")
-        if cover_spec == "auto":
-            cover_spec = {}
-        if isinstance(cover_spec, dict):
-            merged_cover = dict(cover_spec)
-            for key in ("title", "subtitle", "author", "date",
-                        "kicker", "eyebrow", "organization", "org"):
-                if not merged_cover.get(key) and spec.get(key):
-                    merged_cover[key] = spec.get(key)
-            # Default cover style from the styles block (template-provided).
-            if not merged_cover.get("style"):
-                cstyle = (spec.get("styles") or {}).get("cover_style")
-                if cstyle:
-                    merged_cover["style"] = cstyle
-            has_content = any(
-                merged_cover.get(k)
-                for k in ("title", "subtitle", "author", "date",
-                          "kicker", "eyebrow", "logo", "logo_b64", "logo_hint")
+            # Header / footer
+            _build_header_footer(
+                doc,
+                header_spec=header_spec,
+                footer_spec=footer_spec,
+                accent_hex=accent_hex,
+                header_logo=header_logo,
+                first_page_different=cover_present,
             )
-            if has_content:
-                await _build_cover_page(
-                    doc, merged_cover, accent_hex=accent_hex,
-                    image_resolver=_resolver,
+
+            # Cover page (template "auto" cover OR explicit cover dict). In both
+            # cases we backfill missing fields from the top-level spec so authors
+            # can put title/subtitle/author/date in the frontmatter root and only
+            # use ``cover:`` for style/kicker overrides.
+            cover_spec = spec.get("cover")
+            if cover_spec == "auto":
+                cover_spec = {}
+            if isinstance(cover_spec, dict):
+                merged_cover = dict(cover_spec)
+                for key in ("title", "subtitle", "author", "date",
+                            "kicker", "eyebrow", "organization", "org"):
+                    if not merged_cover.get(key) and spec.get(key):
+                        merged_cover[key] = spec.get(key)
+                # Default cover style from the styles block (template-provided).
+                if not merged_cover.get("style"):
+                    cstyle = (spec.get("styles") or {}).get("cover_style")
+                    if cstyle:
+                        merged_cover["style"] = cstyle
+                has_content = any(
+                    merged_cover.get(k)
+                    for k in ("title", "subtitle", "author", "date",
+                              "kicker", "eyebrow", "logo", "logo_b64", "logo_hint")
                 )
+                if has_content:
+                    await _build_cover_page(
+                        doc, merged_cover, accent_hex=accent_hex,
+                        image_resolver=_resolver,
+                    )
 
         # Template-specific intro blocks (memo header, letter addresses)
         template_name = spec.get("template", "blank")
@@ -4518,6 +4949,18 @@ class Tools:
                     "- minutes — meeting minutes (page numbers, green "
                     "accent, section rules).\n"
                     "- blank — base styling only, no default decoration.\n\n"
+                    "LETTERHEAD / SAMPLE (.docx or .dotx):\n"
+                    "Set frontmatter `letterhead: \"Filename.docx\"` "
+                    "(aliases: `sample`, `base_docx`; .dotx accepted). The tool "
+                    "resolves the file from the chat attachments first, then "
+                    "from the upload directories (/mnt/uploads and the "
+                    "OpenWebUI upload dir) — so a file attached in chat OR "
+                    "placed in /mnt/uploads both work; just pass its filename. "
+                    "The tool keeps that file's header, footer and margins and "
+                    "rewrites only the body. Do NOT read the letterhead with "
+                    "execute_code/python-docx; call this tool with `letterhead` "
+                    "set. Do not set `cover` with a letterhead. The filename "
+                    "matches by exact name, case-insensitive, or stem.\n\n"
                     "COVER (frontmatter `cover:` map or JSON `cover`): fields "
                     "`title/subtitle/author/date` (backfilled from the root), "
                     "plus `kicker` (eyebrow label), `organization`, `logo` "
