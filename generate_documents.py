@@ -3,10 +3,10 @@ title: Generate Documents
 author: IANUSTEC
 author_url: https://ianustec.com
 funding_url: https://github.com/ianustec
-description: Generate high-quality native Word (.docx) documents from Markdown or a JSON spec - cover pages, styled headings, tables, callouts, TOC, header/footer
+description: Generate native Word (.docx). For letterhead/carta intestata/.docx/.dotx in chat or /mnt/uploads call this tool with letterhead set. Never use execute_code for Word.
 requirements: python-docx, Pillow, httpx, pydantic, lxml, markdown-it-py, mdit-py-plugins, PyYAML
 required_open_webui_version: 0.4.0
-version: 1.2.0
+version: 1.2.4
 license: MIT
 """
 
@@ -59,6 +59,7 @@ import traceback
 import unicodedata
 import uuid
 import zipfile
+from copy import deepcopy
 from io import BytesIO
 from typing import Any, Optional
 
@@ -115,13 +116,16 @@ except ImportError:
     _HAS_OWUI_FILES = False
 
 try:
+    from open_webui.models.files import Files as _OwuiFiles  # type: ignore
+except ImportError:
+    _OwuiFiles = None  # type: ignore[assignment]
+
+try:
     from open_webui.routers.images import image_generations as _owui_image_generations  # type: ignore
     from open_webui.routers.images import CreateImageForm as _OwuiCreateImageForm  # type: ignore
     from open_webui.models.users import UserModel as _OwuiUserModel  # type: ignore
-    from open_webui.models.files import Files as _OwuiFiles  # type: ignore
     _HAS_OWUI_IMAGES = True
 except ImportError:
-    _OwuiFiles = None  # type: ignore[assignment]
     _HAS_OWUI_IMAGES = False
 
 # Optional storage abstraction so we can read raw bytes back regardless of
@@ -368,63 +372,124 @@ def _b64_decode_lenient(data: str) -> Optional[bytes]:
         return None
 
 
+def _file_row_local_paths(file_row: Any) -> list[str]:
+    """Candidate local paths for an OpenWebUI ``Files`` row."""
+    out: list[str] = []
+    path = getattr(file_row, "path", None)
+    filename = (
+        getattr(file_row, "filename", None)
+        or getattr(file_row, "name", None)
+        or ""
+    )
+    fid = getattr(file_row, "id", None)
+    meta = getattr(file_row, "meta", None) or {}
+    if isinstance(meta, str):
+        try:
+            meta = json.loads(meta)
+        except Exception:
+            meta = {}
+    if isinstance(meta, dict):
+        for key in ("path", "location", "file_path"):
+            val = meta.get(key)
+            if val:
+                out.append(str(val))
+        nested = meta.get("data")
+        if isinstance(nested, dict) and nested.get("path"):
+            out.append(str(nested["path"]))
+    if path:
+        out.append(str(path))
+    names: list[str] = []
+    if filename:
+        names.append(os.path.basename(str(filename)))
+    if fid and filename:
+        names.append(f"{fid}_{os.path.basename(str(filename))}")
+    if fid:
+        names.append(str(fid))
+    for d in _default_letterhead_dirs():
+        for n in names:
+            out.append(os.path.join(d, n))
+    seen: set[str] = set()
+    uniq: list[str] = []
+    for p in out:
+        if p and p not in seen:
+            seen.add(p)
+            uniq.append(p)
+    return uniq
+
+
+def _read_bytes_from_path(path: str) -> Optional[bytes]:
+    if not path or not os.path.isfile(path):
+        return None
+    try:
+        with open(path, "rb") as fh:
+            data = fh.read()
+        return data or None
+    except Exception as exc:
+        print(f"[documents] file: local read failed for {path}: {exc}", file=sys.stderr)
+        return None
+
+
 def _read_owui_file_bytes(file_id: str) -> Optional[bytes]:
     """Read raw bytes for an OpenWebUI file, supporting any storage backend.
 
-    Mirrors ``openwebui_artifacts._read_owui_file_bytes``. The path stored on
-    the ``file`` row may be a local path or an opaque URI (``s3://``, ``gs://``,
-    ``https://...``); we always try local first and fall back to the
-    ``Storage`` abstraction which downloads remote objects to ``UPLOAD_DIR``.
-    The cached copy is removed after read so we don't accumulate temp files.
+    Tries the row ``path``, meta paths, ``UPLOAD_DIR`` / ``/mnt/uploads``
+    name variants, then ``Storage.get_file`` for remote URIs.
     """
-    if not _HAS_OWUI_IMAGES or not file_id:
+    if not file_id or _OwuiFiles is None:
         return None
     try:
         file_row = _OwuiFiles.get_file_by_id(file_id)
     except Exception as exc:
-        print(f"[documents] image: file lookup failed for {file_id}: {exc}", file=sys.stderr)
+        print(f"[documents] file: lookup failed for {file_id}: {exc}", file=sys.stderr)
         return None
-    if not file_row or not getattr(file_row, "path", None):
-        print(f"[documents] image: no file row / path for id {file_id}", file=sys.stderr)
+    if not file_row:
+        print(f"[documents] file: no row for id {file_id}", file=sys.stderr)
         return None
-    path = file_row.path
-    if isinstance(path, str) and os.path.isfile(path):
-        try:
-            with open(path, "rb") as fh:
-                return fh.read()
-        except Exception as exc:
-            print(f"[documents] image: local read failed for {path}: {exc}", file=sys.stderr)
+
+    remote_uris: list[str] = []
+    for path in _file_row_local_paths(file_row):
+        data = _read_bytes_from_path(path)
+        if data:
+            return data
+        if path and not path.startswith(("/", ".")):
+            remote_uris.append(path)
+        elif path and ("://" in path or path.startswith("s3")):
+            remote_uris.append(path)
+
+    row_path = getattr(file_row, "path", None)
+    if isinstance(row_path, str) and row_path not in remote_uris:
+        remote_uris.append(row_path)
+
     if not _HAS_OWUI_STORAGE or _OwuiStorage is None:
         print(
-            f"[documents] image: path not local and Storage unavailable: {path}",
+            f"[documents] file: no local path for {file_id} and Storage unavailable",
             file=sys.stderr,
         )
         return None
-    cached_path: Optional[str] = None
-    try:
-        cached_path = _OwuiStorage.get_file(path)
-        if not cached_path or not os.path.isfile(cached_path):
+    for uri in remote_uris:
+        cached_path: Optional[str] = None
+        try:
+            cached_path = _OwuiStorage.get_file(uri)
+            data = _read_bytes_from_path(cached_path or "")
+            if data:
+                return data
+        except Exception as exc:
             print(
-                f"[documents] image: Storage.get_file returned no local path for {path}",
+                f"[documents] file: Storage download failed for {uri}: {exc}",
                 file=sys.stderr,
             )
-            return None
-        with open(cached_path, "rb") as fh:
-            return fh.read()
-    except Exception as exc:
-        print(f"[documents] image: Storage download failed for {path}: {exc}", file=sys.stderr)
-        return None
-    finally:
-        if (
-            cached_path
-            and isinstance(path, str)
-            and not path.startswith(("/", "."))
-            and os.path.isfile(cached_path)
-        ):
-            try:
-                os.remove(cached_path)
-            except Exception:
-                pass
+        finally:
+            if (
+                cached_path
+                and isinstance(uri, str)
+                and not uri.startswith(("/", "."))
+                and os.path.isfile(cached_path)
+            ):
+                try:
+                    os.remove(cached_path)
+                except Exception:
+                    pass
+    return None
 
 
 _DOCX_EXTS = (".docx", ".dotx")
@@ -651,17 +716,159 @@ def _letterhead_missing_error(
     return msg
 
 
-def _clear_body(doc: _DocxDocument) -> None:
-    """Remove every body child except the trailing ``w:sectPr``.
+def _el_text(el) -> str:
+    """Visible paragraph text, ignoring VML/AlternateContent fallbacks."""
+    parts: list[str] = []
+    for t in el.xpath('.//*[local-name()="t"]'):
+        skip = False
+        parent = t.getparent()
+        while parent is not None and parent is not el:
+            ln = (parent.tag or "").split("}")[-1].lower()
+            if ln in ("fallback", "pict", "textbox"):
+                skip = True
+                break
+            parent = parent.getparent()
+        if not skip:
+            parts.append(t.text or "")
+    return "".join(parts).replace("\xa0", " ").strip()
 
-    Keeping ``sectPr`` preserves letterhead header/footer refs and page
-    geometry (same approach as ``openwebui_preventivo``).
+
+def _el_has_drawing(el) -> bool:
+    return bool(el.xpath('.//*[local-name()="drawing" or local-name()="pict"]'))
+
+
+def _is_empty_para(el) -> bool:
+    return (
+        el.tag == qn("w:p")
+        and not _el_text(el)
+        and not _el_has_drawing(el)
+    )
+
+
+def _drawing_only_clone(el):
+    """Clone a paragraph keeping only floating drawings (drop sample text)."""
+    clone = deepcopy(el)
+    for child in list(clone):
+        if child.tag == qn("w:pPr"):
+            continue
+        if _el_has_drawing(child):
+            for t in child.xpath('.//*[local-name()="t"]'):
+                t.text = ""
+            continue
+        clone.remove(child)
+    return clone
+
+
+def _looks_like_letterhead_chrome(text: str) -> bool:
+    if not text or len(text) > 280:
+        return False
+    low = text.lower()
+    needles = (
+        "p.iva", "p.iva", "partita iva", "c.f.", "codice fiscale",
+        "sede legale", "sede operativa", "rea ", "c.c.i.a.a",
+        "tel.", "tel:", "fax", "pec:", "www.", "http",
+        "@", "via ", "piazza ", "viale ", "corso ",
+    )
+    return any(n in low for n in needles)
+
+
+def _split_letterhead_body(children: list):
+    """Keep letterhead chrome; drop sample body text.
+
+    Returns (leading_empty, decorations, trailing_chrome).
+    """
+    lead: list = []
+    i = 0
+    while i < len(children) and _is_empty_para(children[i]) and len(lead) < 8:
+        lead.append(children[i])
+        i += 1
+
+    j = len(children) - 1
+    while j >= i and _is_empty_para(children[j]):
+        j -= 1
+
+    tail: list = []
+    empty_run = 0
+    k = j
+    while k >= i:
+        if _is_empty_para(children[k]):
+            empty_run += 1
+            if empty_run >= 3 and tail:
+                break
+            k -= 1
+            continue
+        empty_run = 0
+        text = _el_text(children[k])
+        if len(text) > 280:
+            break
+        tail.append(children[k])
+        k -= 1
+    tail.reverse()
+    if tail and not any(_looks_like_letterhead_chrome(_el_text(el)) for el in tail):
+        if len(tail) < 2:
+            tail = []
+
+    kept = set(map(id, lead + tail))
+    decor: list = []
+    for el in children[i:]:
+        if id(el) in kept:
+            continue
+        if not _el_has_drawing(el):
+            continue
+        names = " ".join(
+            str(v) for v in (el.xpath(".//@id") + el.xpath(".//@name") + el.xpath(".//@title"))
+        ).lower()
+        is_mark = "watermark" in names or "filigrana" in names
+        if _el_text(el) and not is_mark:
+            continue
+        decor.append(_drawing_only_clone(el) if _el_text(el) else el)
+    return lead, decor, tail
+
+
+def _clear_body(doc: _DocxDocument) -> None:
+    """Clear sample body text while keeping letterhead chrome.
+
+    Preserves ``sectPr`` (header/footer refs, page geometry), leading empty
+    paragraphs (clearance under a header logo), body-anchored decorations
+    (watermarks / floating images), and a trailing address block when it
+    looks like letterhead chrome rather than sample copy.
     """
     body = doc.element.body
     sect_pr = body.find(qn("w:sectPr"))
-    for child in list(body):
-        if child is not sect_pr:
-            body.remove(child)
+    children = [c for c in list(body) if c is not sect_pr]
+    lead, decor, tail = _split_letterhead_body(children)
+
+    for child in children:
+        body.remove(child)
+
+    keep = list(lead) + list(decor)
+    for el in keep:
+        if sect_pr is not None:
+            sect_pr.addprevious(el)
+        else:
+            body.append(el)
+
+    doc._neura_letterhead_tail = tail  # type: ignore[attr-defined]
+
+
+def _append_letterhead_tail(doc: _DocxDocument) -> None:
+    """Re-attach trailing letterhead chrome after generated content."""
+    tail = getattr(doc, "_neura_letterhead_tail", None) or []
+    if not tail:
+        return
+    body = doc.element.body
+    sect_pr = body.find(qn("w:sectPr"))
+    spacer = OxmlElement("w:p")
+    if sect_pr is not None:
+        sect_pr.addprevious(spacer)
+    else:
+        body.append(spacer)
+    for el in tail:
+        if sect_pr is not None:
+            sect_pr.addprevious(el)
+        else:
+            body.append(el)
+    doc._neura_letterhead_tail = []  # type: ignore[attr-defined]
 
 
 def _dotx_to_docx_bytes(data: bytes) -> bytes:
@@ -730,6 +937,50 @@ def _load_letterhead_doc(
         raise ValueError(f"could not open letterhead .docx: {exc}") from exc
     except Exception as exc:
         raise ValueError(f"could not open letterhead .docx: {exc}") from exc
+
+
+def _resolve_letterhead_doc(
+    letterhead_name: str,
+    metadata: Any = None,
+    files: Any = None,
+    letterhead_dirs: Optional[list[str]] = None,
+) -> _DocxDocument:
+    """Load a letterhead, trying Files API then on-disk paths.
+
+    A chat attachment id is not enough: the Files row path may be missing
+    on this pod (S3, other replica, or the file only lives in /mnt/uploads).
+    """
+    errors: list[str] = []
+    dirs = letterhead_dirs or _default_letterhead_dirs()
+    candidates = _chat_docx_files(metadata, files)
+    matched = _match_letterhead(letterhead_name, candidates)
+    if matched:
+        data = _read_owui_file_bytes(matched["id"])
+        if data:
+            return _load_letterhead_doc(raw=data)
+        errors.append(
+            f"Files API id={matched['id']} unreadable; trying disk"
+        )
+        print(f"[documents] letterhead: {errors[-1]}", file=sys.stderr)
+        disk_from_attach = _match_letterhead_disk(
+            matched.get("name") or letterhead_name,
+            _list_disk_docx(dirs),
+        )
+        if disk_from_attach:
+            try:
+                return _load_letterhead_doc(path=disk_from_attach["id"])
+            except Exception as exc:
+                errors.append(str(exc))
+
+    disk = _list_disk_docx(dirs)
+    matched_disk = _match_letterhead_disk(letterhead_name, disk)
+    if matched_disk:
+        return _load_letterhead_doc(path=matched_disk["id"])
+
+    raise ValueError(
+        _letterhead_missing_error(letterhead_name, candidates, disk, dirs)
+        + ((" " + "; ".join(errors)) if errors else "")
+    )
 
 
 def _coalesce_letterhead_name(spec: dict) -> Optional[str]:
@@ -2479,6 +2730,211 @@ def _set_run_tracking(run, twentieths: int) -> None:
         pass
 
 
+_BUILTIN_STYLE_NAMES = {
+    "heading 1": "Heading 1",
+    "heading 2": "Heading 2",
+    "heading 3": "Heading 3",
+    "heading 4": "Heading 4",
+    "quote": "Quote",
+    "caption": "Caption",
+}
+
+
+def _style_exists(doc: _DocxDocument, name: str) -> bool:
+    try:
+        doc.styles[name]
+        return True
+    except KeyError:
+        return False
+
+
+def _safe_set_paragraph_style(paragraph, name: str) -> bool:
+    try:
+        paragraph.style = name
+        return True
+    except (KeyError, ValueError):
+        return False
+
+
+def _ensure_builtin_styles(doc: _DocxDocument) -> list[str]:
+    """Inject missing Word built-ins (Heading 1-4, Quote, Caption).
+
+    Company letterheads, especially from non-English Word, often omit unused
+    built-in styles. ``add_paragraph(style='Heading 1')`` then raises
+    KeyError and the block is dropped.
+    """
+    needed = [
+        n for n in (
+            "Heading 1", "Heading 2", "Heading 3", "Heading 4",
+            "Quote", "Caption",
+        )
+        if not _style_exists(doc, n)
+    ]
+    if not needed:
+        return []
+    blank = Document()
+    src_root = blank.styles.element
+    dst_root = doc.styles.element
+    existing_ids = {
+        s.get(qn("w:styleId")) for s in dst_root.findall(qn("w:style"))
+    }
+    added: list[str] = []
+    for src in src_root.findall(qn("w:style")):
+        sid = src.get(qn("w:styleId"))
+        name_el = src.find(qn("w:name"))
+        name_val = (name_el.get(qn("w:val")) if name_el is not None else "") or ""
+        display = _BUILTIN_STYLE_NAMES.get(name_val.lower())
+        if display not in needed or sid in existing_ids:
+            continue
+        dst_root.append(deepcopy(src))
+        added.append(display)
+    return added
+
+
+_GENERIC_FONTS = {
+    "calibri", "cambria", "arial", "times new roman", "calibril",
+    "consolas", "courier new", "helvetica",
+}
+
+
+def _run_ascii_font(run) -> Optional[str]:
+    name = run.font.name
+    if name:
+        return name
+    rpr = run._element.find(qn("w:rPr"))
+    if rpr is None:
+        return None
+    rf = rpr.find(qn("w:rFonts"))
+    if rf is None:
+        return None
+    return rf.get(qn("w:ascii")) or rf.get(qn("w:hAnsi"))
+
+
+def _detect_letterhead_fonts(doc: _DocxDocument) -> dict[str, Any]:
+    """Read the fonts actually used in a letterhead sample body."""
+    from collections import Counter
+
+    body_w: Counter[str] = Counter()
+    head_w: Counter[str] = Counter()
+    sizes: Counter[int] = Counter()
+    for p in doc.paragraphs:
+        style_name = ((p.style.name if p.style else "") or "").lower()
+        is_head = (
+            style_name in ("title", "heading 1", "heading 2", "subtitle")
+            or "titolo" in style_name
+        )
+        for run in p.runs:
+            text = (run.text or "").strip()
+            if not text:
+                continue
+            font = _run_ascii_font(run)
+            if not font:
+                continue
+            bucket = head_w if is_head else body_w
+            bucket[font] += len(text)
+            if run.font.size:
+                try:
+                    sizes[int(round(run.font.size.pt))] += len(text)
+                except Exception:
+                    pass
+
+    def _pick(counter: Counter[str]) -> Optional[str]:
+        if not counter:
+            return None
+        branded = [
+            (n, w) for n, w in counter.most_common()
+            if n.lower() not in _GENERIC_FONTS
+        ]
+        if branded and branded[0][1] >= max(8, counter.most_common(1)[0][1] // 4):
+            return branded[0][0]
+        return counter.most_common(1)[0][0]
+
+    body = _pick(body_w)
+    heading = _pick(head_w)
+    if not heading:
+        try:
+            heading = doc.styles["Title"].font.name
+        except KeyError:
+            heading = None
+    if not body:
+        try:
+            body = doc.styles["Normal"].font.name
+        except KeyError:
+            body = None
+    heading = heading or body
+    size_pt = sizes.most_common(1)[0][0] if sizes else None
+    return {"body": body, "heading": heading, "size_pt": size_pt}
+
+
+def _set_rfonts_on_rpr(rpr, name: str) -> None:
+    rfonts = rpr.find(qn("w:rFonts"))
+    if rfonts is None:
+        rfonts = OxmlElement("w:rFonts")
+        rpr.insert(0, rfonts)
+    for attr in ("w:ascii", "w:hAnsi", "w:cs", "w:eastAsia"):
+        rfonts.set(qn(attr), name)
+    for theme_attr in (
+        "w:asciiTheme", "w:hAnsiTheme", "w:cstheme", "w:eastAsiaTheme",
+    ):
+        if rfonts.get(qn(theme_attr)):
+            del rfonts.attrib[qn(theme_attr)]
+
+
+def _apply_font_to_style(style, name: str) -> None:
+    if not name or style is None:
+        return
+    try:
+        style.font.name = name
+    except Exception:
+        pass
+    try:
+        rpr = style.element.get_or_add_rPr()
+        _set_rfonts_on_rpr(rpr, name)
+    except Exception:
+        pass
+
+
+def _apply_font_to_run(run, name: str) -> None:
+    if not name or run is None:
+        return
+    try:
+        run.font.name = name
+        rpr = run._r.get_or_add_rPr()
+        _set_rfonts_on_rpr(rpr, name)
+    except Exception:
+        pass
+
+
+def _apply_letterhead_fonts(doc: _DocxDocument, fonts: dict[str, Any]) -> None:
+    """Stamp detected letterhead fonts onto Normal / Heading styles."""
+    body = fonts.get("body")
+    heading = fonts.get("heading") or body
+    if body:
+        try:
+            _apply_font_to_style(doc.styles["Normal"], body)
+        except KeyError:
+            pass
+        try:
+            _apply_font_to_style(doc.styles["Body Text"], body)
+        except KeyError:
+            pass
+    if heading:
+        for level in (1, 2, 3, 4):
+            try:
+                _apply_font_to_style(doc.styles[f"Heading {level}"], heading)
+            except KeyError:
+                continue
+        try:
+            _apply_font_to_style(doc.styles["Title"], heading)
+        except KeyError:
+            pass
+    doc._neura_letterhead_fonts = fonts  # type: ignore[attr-defined]
+    try:
+        doc.part._neura_letterhead_fonts = fonts  # type: ignore[attr-defined]
+    except Exception:
+        pass
+
+
 def _apply_styles(doc: _DocxDocument, styles: dict, *, soft: bool = False) -> None:
     """Configure base fonts + heading sizes + colours from the design tokens.
 
@@ -2499,6 +2955,7 @@ def _apply_styles(doc: _DocxDocument, styles: dict, *, soft: bool = False) -> No
     rule_hex = theme["rule_strong"]
 
     if soft:
+        added = _ensure_builtin_styles(doc)
         _ensure_caption_style(doc, font_name)
         try:
             link_style = doc.styles["Hyperlink"]
@@ -2507,6 +2964,22 @@ def _apply_styles(doc: _DocxDocument, styles: dict, *, soft: bool = False) -> No
             link_style.font.underline = True
         except KeyError:
             pass
+        for name in added:
+            if not name.startswith("Heading "):
+                continue
+            try:
+                level = int(name.split()[-1])
+                style = doc.styles[name]
+            except (KeyError, ValueError):
+                continue
+            style.font.size = Pt(HEADING_SIZES_PT.get(level, base_size))
+            style.font.bold = True
+            style.font.color.rgb = _rgb(
+                heading_hex if level == 1 else theme["accent"]
+            )
+            pf = style.paragraph_format
+            pf.space_before = Pt(HEADING_BEFORE_PT.get(level, 6))
+            pf.space_after = Pt(HEADING_AFTER_PT.get(level, 4))
         return
 
     # Which section levels get the divider rule (overridable via styles).
@@ -3146,6 +3619,10 @@ def _add_inline_runs(paragraph, text: str, *, accent_rgb: tuple[int, int, int]) 
         if spec.get("accent"):
             run.font.color.rgb = RGBColor(*accent_rgb)
             run.bold = True
+        part = getattr(paragraph, "part", None)
+        lh = getattr(part, "_neura_letterhead_fonts", None) or {}
+        if not lh:
+            lh = getattr(getattr(part, "document", None), "_neura_letterhead_fonts", None) or {}
         if spec.get("code"):
             run.font.name = "Consolas"
             try:
@@ -3156,7 +3633,6 @@ def _add_inline_runs(paragraph, text: str, *, accent_rgb: tuple[int, int, int]) 
                     rpr.insert(0, rfonts)
                 rfonts.set(qn("w:ascii"), "Consolas")
                 rfonts.set(qn("w:hAnsi"), "Consolas")
-                # Light grey background for inline code
                 shd = OxmlElement("w:shd")
                 shd.set(qn("w:val"), "clear")
                 shd.set(qn("w:color"), "auto")
@@ -3164,6 +3640,8 @@ def _add_inline_runs(paragraph, text: str, *, accent_rgb: tuple[int, int, int]) 
                 rpr.append(shd)
             except Exception:
                 pass
+        elif lh.get("body"):
+            _apply_font_to_run(run, lh["body"])
 
 
 def _add_hyperlink(paragraph, text: str, url: str) -> None:
@@ -3226,7 +3704,12 @@ def _render_heading(doc: _DocxDocument, block: dict, *, accent_rgb) -> None:
         er.font.color.rgb = _rgb(theme["accent"])
         _set_run_tracking(er, 40)
 
-    p = doc.add_paragraph(style=f"Heading {level}")
+    p = doc.add_paragraph()
+    if not _safe_set_paragraph_style(p, f"Heading {level}"):
+        p.paragraph_format.space_before = Pt(HEADING_BEFORE_PT.get(level, 6))
+        p.paragraph_format.space_after = Pt(HEADING_AFTER_PT.get(level, 4))
+        p.paragraph_format.keep_with_next = True
+        p._neura_manual_heading = level  # type: ignore[attr-defined]
     if eyebrow:
         p.paragraph_format.space_before = Pt(1)
     align = (block.get("align") or "").lower()
@@ -3252,6 +3735,18 @@ def _render_heading(doc: _DocxDocument, block: dict, *, accent_rgb) -> None:
         # Match the number to the heading tier colour (navy H1 / accent H2+).
         nrun.font.color.rgb = _rgb(theme["heading"] if level == 1 else theme["accent"])
     _add_inline_runs(p, text, accent_rgb=accent_rgb)
+    if getattr(p, "_neura_manual_heading", None):
+        size = HEADING_SIZES_PT.get(level, theme["size_pt"])
+        color = _rgb(theme["heading"] if level == 1 else theme["accent"])
+        for run in p.runs:
+            run.bold = True
+            run.font.size = Pt(size)
+            if not run.font.color.rgb:
+                run.font.color.rgb = color
+    lh = getattr(doc, "_neura_letterhead_fonts", None) or {}
+    if lh.get("heading"):
+        for run in p.runs:
+            _apply_font_to_run(run, lh["heading"])
 
 
 def _render_paragraph(doc: _DocxDocument, block: dict, *, accent_rgb) -> None:
@@ -4051,7 +4546,8 @@ def _render_page_break(doc: _DocxDocument) -> None:
 def _render_toc(doc: _DocxDocument, block: dict, *, accent_rgb) -> None:
     title = block.get("title") or "Table of Contents"
     depth = max(1, min(6, int(block.get("depth") or 3)))
-    p = doc.add_paragraph(style="Heading 1")
+    p = doc.add_paragraph()
+    _safe_set_paragraph_style(p, "Heading 1")
     run = p.add_run(_smart_quotes(title))
     run.bold = True
     toc_p = doc.add_paragraph()
@@ -4467,6 +4963,15 @@ class Tools:
     ) -> str:
         """Generate a Word (.docx) document from a structured spec.
 
+        WHEN TO CALL (do this first, do not explore other tools):
+        user asks for a Word/.docx/letter/report OR names a letterhead /
+        carta intestata / sample .docx/.dotx, including files in chat or
+        ``/mnt/uploads``. Set frontmatter ``letterhead: "exact-filename.docx"``
+        and write the body in Markdown. The tool finds the file itself.
+
+        NEVER use execute_code, python-docx, zipfile, or /mnt/uploads listing
+        to read or build a Word file. Those paths fail (no lxml in Pyodide).
+
         The ``content`` parameter accepts TWO formats (auto-detected):
 
         1. **Markdown-with-frontmatter** (preferred, more compact, more
@@ -4476,6 +4981,15 @@ class Tools:
            Inline ``==text==`` maps to accent-colored runs.
 
            Example:
+
+               ---
+               template: letter
+               letterhead: "carta intestata.docx"
+               title: Lettera commerciale
+               ---
+
+               # Oggetto
+               Body...
 
                ---
                template: report
@@ -4611,30 +5125,27 @@ class Tools:
             if letterhead_raw is not None:
                 doc = _load_letterhead_doc(raw=letterhead_raw)
             else:
-                # 1) chat attachments (Files API)
-                candidates = _chat_docx_files(metadata, files)
-                matched = _match_letterhead(letterhead_name, candidates)
-                if matched:
-                    doc = _load_letterhead_doc(matched["id"])
-                else:
-                    # 2) filesystem fallback (/mnt/uploads, OpenWebUI uploads)
-                    dirs = letterhead_dirs or _default_letterhead_dirs()
-                    disk = _list_disk_docx(dirs)
-                    matched_disk = _match_letterhead_disk(letterhead_name, disk)
-                    if not matched_disk:
-                        raise ValueError(
-                            _letterhead_missing_error(
-                                letterhead_name, candidates, disk, dirs
-                            )
-                        )
-                    doc = _load_letterhead_doc(path=matched_disk["id"])
+                doc = _resolve_letterhead_doc(
+                    letterhead_name,
+                    metadata=metadata,
+                    files=files,
+                    letterhead_dirs=letterhead_dirs,
+                )
+            lh_fonts = _detect_letterhead_fonts(doc)
             _clear_body(doc)
+            doc._neura_letterhead_fonts = lh_fonts  # type: ignore[attr-defined]
         else:
             doc = Document()
 
         # Resolve the design-token palette ONCE and attach it to the doc so
         # every renderer reads colours/fonts from a single coherent source.
         theme = _resolve_theme(spec)
+        if use_letterhead:
+            lh_fonts = getattr(doc, "_neura_letterhead_fonts", None) or {}
+            if lh_fonts.get("body"):
+                theme["font"] = lh_fonts["body"]
+            if lh_fonts.get("size_pt"):
+                theme["size_pt"] = int(lh_fonts["size_pt"])
         doc._neura_theme = theme  # type: ignore[attr-defined]
 
         # Section-numbering preferences (read by _render_heading).
@@ -4649,6 +5160,9 @@ class Tools:
         if use_letterhead:
             # Keep company page setup + header/footer; only soft-ensure styles.
             _apply_styles(doc, spec.get("styles") or {}, soft=True)
+            _apply_letterhead_fonts(
+                doc, getattr(doc, "_neura_letterhead_fonts", None) or {},
+            )
             if spec.get("cover"):
                 print(
                     "[documents] letterhead: ignoring cover (conflicts with "
@@ -4757,6 +5271,9 @@ class Tools:
             p = doc.add_paragraph()
             run = p.add_run(_smart_quotes(spec["letter_fields"]["closing"]))
             run.italic = True
+
+        if use_letterhead:
+            _append_letterhead_tail(doc)
 
         return doc
 
@@ -4905,16 +5422,25 @@ class Tools:
             "function": {
                 "name": "generate_document",
                 "description": (
-                    "Generate a professional Word (.docx) document and save "
-                    "it via the OpenWebUI Files API. On success, the return "
-                    "value is a self-contained [TOOL_RESULT] blob that "
-                    "includes OUTPUT_FOR_USER instructions and the exact "
-                    "markdown download line — follow that blob, not any "
-                    "external system prompt.\n\n"
+                    "FIRST CHOICE for any Word/.docx/letter/report. "
+                    "If the user mentions letterhead, carta intestata, a "
+                    ".docx/.dotx attachment, or /mnt/uploads, call THIS tool "
+                    "immediately with frontmatter letterhead: \"Filename.docx\". "
+                    "Do NOT call execute_code, python-docx, zipfile, or listdir "
+                    "on /mnt/uploads. This tool resolves the file from chat "
+                    "attachments and /mnt/uploads by filename.\n\n"
                     "Use when the user asks for: a Word document, .docx, "
-                    "business letter, report, memo, internal note, proposal, "
-                    "meeting minutes, contract, policy, manual. NEVER "
-                    "fabricate a .docx yourself — always use this tool.\n\n"
+                    "business letter, report, memo, proposal, minutes, "
+                    "contract, or anything on company letterhead. NEVER "
+                    "fabricate a .docx yourself.\n\n"
+                    "Letterhead example:\n"
+                    "   ---\n"
+                    "   template: letter\n"
+                    "   letterhead: \"carta intestata.docx\"\n"
+                    "   title: Lettera commerciale\n"
+                    "   ---\n"
+                    "   # Oggetto\n"
+                    "   Body in Markdown...\n\n"
                     "INPUT (auto-detected — prefer Markdown):\n"
                     "1) Markdown with YAML frontmatter (preferred — fewer "
                     "tokens than JSON, robust on long docs):\n"

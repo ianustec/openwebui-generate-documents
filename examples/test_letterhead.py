@@ -72,10 +72,9 @@ def test_clear_body_preserves_header():
     assert "OLD BODY" in doc.paragraphs[0].text
     assert doc.sections[0].header.paragraphs[0].text == "ACME Letterhead HEADER"
     mod._clear_body(doc)
-    # Body should be empty of paragraphs (sectPr only); header remains.
     body = doc.element.body
     assert body.find(qn("w:sectPr")) is not None
-    assert all(child.tag == qn("w:sectPr") for child in body)
+    assert not any("OLD BODY" in (p.text or "") for p in doc.paragraphs)
     assert doc.sections[0].header.paragraphs[0].text == "ACME Letterhead HEADER"
     assert doc.sections[0].footer.paragraphs[0].text == "ACME Letterhead FOOTER"
     print("OK clear_body preserves header/footer")
@@ -118,6 +117,29 @@ async def test_build_without_letterhead_regression():
     print("OK no-letterhead regression", size)
 
 
+def test_resolve_falls_back_to_disk_when_api_unreadable():
+    raw = _make_letterhead_bytes()
+    with tempfile.TemporaryDirectory() as tmp:
+        path = Path(tmp) / "carta intestata.docx"
+        path.write_bytes(raw)
+        orig = mod._read_owui_file_bytes
+        mod._read_owui_file_bytes = lambda _fid: None
+        try:
+            doc = mod._resolve_letterhead_doc(
+                "carta intestata.docx",
+                metadata={"files": [
+                    {"id": "947bc6b5-3a9d-4ca4-966d-d160727f9533",
+                     "filename": "carta intestata.docx"},
+                ]},
+                files=None,
+                letterhead_dirs=[tmp],
+            )
+        finally:
+            mod._read_owui_file_bytes = orig
+        assert doc.sections[0].header.paragraphs[0].text == "ACME Letterhead HEADER"
+    print("OK Files API miss falls back to disk")
+
+
 def test_coalesce_aliases():
     s = mod._resolve_template({"template": "blank", "sample": "X.docx"})
     assert s.get("letterhead") == "X.docx"
@@ -130,6 +152,7 @@ def main():
     test_match_rules()
     test_chat_docx_files_filter()
     test_clear_body_preserves_header()
+    test_resolve_falls_back_to_disk_when_api_unreadable()
     test_coalesce_aliases()
     asyncio.run(test_build_with_letterhead_bytes())
     asyncio.run(test_build_without_letterhead_regression())
