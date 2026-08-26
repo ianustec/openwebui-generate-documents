@@ -4911,7 +4911,11 @@ class Tools:
             description="Bearer token for image_generation_url fallback (if any).",
         )
         docx_export_dir: str = Field(
-            default="/app/backend/data/cache/files",
+            default=os.path.join(
+                os.environ.get("DATA_DIR", "/app/backend/data"),
+                "cache",
+                "files",
+            ),
             description=(
                 "Fallback path for .docx export when the OpenWebUI Files API "
                 "is unavailable. Same convention as the slides/dashboard tool."
@@ -5076,7 +5080,7 @@ class Tools:
         docx_bytes = buf.getvalue()
 
         await self._emit_status(__event_emitter__, "Saving file...", done=False)
-        fname, download_url, save_err = self._save_docx(
+        fname, download_url, save_err = await self._save_docx(
             docx_bytes,
             title=_document_title(spec),
             request=__request__,
@@ -5309,7 +5313,7 @@ class Tools:
         return _parse_markdown(text)
 
     # ── Save / files API ─────────────────────────────────────────────────────
-    def _save_docx(
+    async def _save_docx(
         self,
         docx_bytes: bytes,
         *,
@@ -5331,7 +5335,7 @@ class Tools:
         # --- Primary: OpenWebUI Files API (visible in UI Files panel) ---
         if _HAS_OWUI_FILES and request and user_dict:
             try:
-                user_model = Users.get_user_by_id(user_dict["id"])
+                user_model = await Users.get_user_by_id(user_dict["id"])
                 if user_model:
                     upload = UploadFile(
                         file=BytesIO(docx_bytes),
@@ -5342,7 +5346,7 @@ class Tools:
                                 "wordprocessingml.document"
                         }),
                     )
-                    file_item = upload_file_handler(
+                    file_item = await upload_file_handler(
                         request=request,
                         file=upload,
                         metadata={},
@@ -5357,7 +5361,9 @@ class Tools:
                 traceback.print_exc()
 
         # --- Fallback: cache/files (download only, ASCII-safe path) ---
-        export_dir = (self.valves.docx_export_dir or "").strip() or "/app/backend/data/cache/files"
+        export_dir = (self.valves.docx_export_dir or "").strip() or os.path.join(
+            os.environ.get("DATA_DIR", "/app/backend/data"), "cache", "files"
+        )
         try:
             os.makedirs(export_dir, mode=0o775, exist_ok=True)
             # ASCII slug + short suffix: safe for the static route and unique
