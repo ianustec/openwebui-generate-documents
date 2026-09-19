@@ -51,6 +51,7 @@ license: MIT
 from __future__ import annotations
 
 import base64
+import inspect
 import json
 import os
 import re
@@ -429,7 +430,14 @@ def _read_bytes_from_path(path: str) -> Optional[bytes]:
         return None
 
 
-def _read_owui_file_bytes(file_id: str) -> Optional[bytes]:
+async def _maybe_await(value):
+    """Await coroutines; pass through sync return values (OWUI v0.6 vs v0.11)."""
+    if inspect.isawaitable(value):
+        return await value
+    return value
+
+
+async def _read_owui_file_bytes(file_id: str) -> Optional[bytes]:
     """Read raw bytes for an OpenWebUI file, supporting any storage backend.
 
     Tries the row ``path``, meta paths, ``UPLOAD_DIR`` / ``/mnt/uploads``
@@ -438,7 +446,7 @@ def _read_owui_file_bytes(file_id: str) -> Optional[bytes]:
     if not file_id or _OwuiFiles is None:
         return None
     try:
-        file_row = _OwuiFiles.get_file_by_id(file_id)
+        file_row = await _maybe_await(_OwuiFiles.get_file_by_id(file_id))
     except Exception as exc:
         print(f"[documents] file: lookup failed for {file_id}: {exc}", file=sys.stderr)
         return None
@@ -520,12 +528,12 @@ def _file_entry_id_name(entry: Any) -> tuple[str, str]:
     return fid, name
 
 
-def _enrich_filename_from_owui(file_id: str) -> str:
+async def _enrich_filename_from_owui(file_id: str) -> str:
     """Best-effort filename lookup via OpenWebUI Files model."""
     if not file_id or not _HAS_OWUI_IMAGES or _OwuiFiles is None:
         return ""
     try:
-        row = _OwuiFiles.get_file_by_id(file_id)
+        row = await _maybe_await(_OwuiFiles.get_file_by_id(file_id))
     except Exception:
         return ""
     if not row:
@@ -538,7 +546,7 @@ def _enrich_filename_from_owui(file_id: str) -> str:
     return str(name or "").strip()
 
 
-def _chat_docx_files(
+async def _chat_docx_files(
     metadata: Any = None,
     files: Any = None,
 ) -> list[dict[str, str]]:
@@ -567,7 +575,7 @@ def _chat_docx_files(
         if not fid or fid in seen:
             continue
         if not name:
-            name = _enrich_filename_from_owui(fid)
+            name = await _enrich_filename_from_owui(fid)
         if not name or not _is_docx_name(name):
             continue
         seen.add(fid)
@@ -896,7 +904,7 @@ def _dotx_to_docx_bytes(data: bytes) -> bytes:
     return out_buf.getvalue()
 
 
-def _load_letterhead_doc(
+async def _load_letterhead_doc(
     file_id: Optional[str] = None,
     *,
     raw: Optional[bytes] = None,
@@ -913,7 +921,7 @@ def _load_letterhead_doc(
     if data is None:
         if not file_id:
             raise ValueError("letterhead file id is empty")
-        data = _read_owui_file_bytes(file_id)
+        data = await _read_owui_file_bytes(file_id)
     if not data:
         raise ValueError(
             f"could not read letterhead file bytes"
@@ -939,7 +947,7 @@ def _load_letterhead_doc(
         raise ValueError(f"could not open letterhead .docx: {exc}") from exc
 
 
-def _resolve_letterhead_doc(
+async def _resolve_letterhead_doc(
     letterhead_name: str,
     metadata: Any = None,
     files: Any = None,
@@ -952,12 +960,12 @@ def _resolve_letterhead_doc(
     """
     errors: list[str] = []
     dirs = letterhead_dirs or _default_letterhead_dirs()
-    candidates = _chat_docx_files(metadata, files)
+    candidates = await _chat_docx_files(metadata, files)
     matched = _match_letterhead(letterhead_name, candidates)
     if matched:
-        data = _read_owui_file_bytes(matched["id"])
+        data = await _read_owui_file_bytes(matched["id"])
         if data:
-            return _load_letterhead_doc(raw=data)
+            return await _load_letterhead_doc(raw=data)
         errors.append(
             f"Files API id={matched['id']} unreadable; trying disk"
         )
@@ -968,14 +976,14 @@ def _resolve_letterhead_doc(
         )
         if disk_from_attach:
             try:
-                return _load_letterhead_doc(path=disk_from_attach["id"])
+                return await _load_letterhead_doc(path=disk_from_attach["id"])
             except Exception as exc:
                 errors.append(str(exc))
 
     disk = _list_disk_docx(dirs)
     matched_disk = _match_letterhead_disk(letterhead_name, disk)
     if matched_disk:
-        return _load_letterhead_doc(path=matched_disk["id"])
+        return await _load_letterhead_doc(path=matched_disk["id"])
 
     raise ValueError(
         _letterhead_missing_error(letterhead_name, candidates, disk, dirs)
@@ -1135,7 +1143,7 @@ async def _generate_image_via_openwebui(
 
     file_id_match = re.search(r"/files/([0-9a-fA-F-]{8,})/", url)
     if file_id_match:
-        data = _read_owui_file_bytes(file_id_match.group(1))
+        data = await _read_owui_file_bytes(file_id_match.group(1))
         if data:
             return data
         print(
@@ -5076,7 +5084,7 @@ class Tools:
         docx_bytes = buf.getvalue()
 
         await self._emit_status(__event_emitter__, "Saving file...", done=False)
-        fname, download_url, save_err = self._save_docx(
+        fname, download_url, save_err = await self._save_docx(
             docx_bytes,
             title=_document_title(spec),
             request=__request__,
@@ -5123,9 +5131,9 @@ class Tools:
 
         if use_letterhead:
             if letterhead_raw is not None:
-                doc = _load_letterhead_doc(raw=letterhead_raw)
+                doc = await _load_letterhead_doc(raw=letterhead_raw)
             else:
-                doc = _resolve_letterhead_doc(
+                doc = await _resolve_letterhead_doc(
                     letterhead_name,
                     metadata=metadata,
                     files=files,
@@ -5309,7 +5317,7 @@ class Tools:
         return _parse_markdown(text)
 
     # ── Save / files API ─────────────────────────────────────────────────────
-    def _save_docx(
+    async def _save_docx(
         self,
         docx_bytes: bytes,
         *,
@@ -5331,7 +5339,7 @@ class Tools:
         # --- Primary: OpenWebUI Files API (visible in UI Files panel) ---
         if _HAS_OWUI_FILES and request and user_dict:
             try:
-                user_model = Users.get_user_by_id(user_dict["id"])
+                user_model = await _maybe_await(Users.get_user_by_id(user_dict["id"]))
                 if user_model:
                     upload = UploadFile(
                         file=BytesIO(docx_bytes),
@@ -5342,13 +5350,13 @@ class Tools:
                                 "wordprocessingml.document"
                         }),
                     )
-                    file_item = upload_file_handler(
+                    file_item = await _maybe_await(upload_file_handler(
                         request=request,
                         file=upload,
                         metadata={},
                         process=False,
                         user=user_model,
-                    )
+                    ))
                     if file_item:
                         file_id = getattr(file_item, "id", None)
                         if file_id:
