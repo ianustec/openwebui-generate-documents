@@ -6,7 +6,7 @@ funding_url: https://github.com/ianustec
 description: Generate native Word (.docx). For letterhead/carta intestata/.docx/.dotx in chat or /mnt/uploads call this tool with letterhead set. Never use execute_code for Word.
 requirements: python-docx, Pillow, httpx, pydantic, lxml, markdown-it-py, mdit-py-plugins, PyYAML
 required_open_webui_version: 0.4.0
-version: 1.2.4
+version: 1.3.2
 license: MIT
 """
 
@@ -51,6 +51,7 @@ license: MIT
 from __future__ import annotations
 
 import base64
+import inspect
 import json
 import os
 import re
@@ -429,7 +430,13 @@ def _read_bytes_from_path(path: str) -> Optional[bytes]:
         return None
 
 
-def _read_owui_file_bytes(file_id: str) -> Optional[bytes]:
+async def _maybe_await(value: Any) -> Any:
+    """OpenWebUI 0.12 made the model/router helpers async; older releases
+    are sync. Accept both."""
+    return await value if inspect.isawaitable(value) else value
+
+
+async def _read_owui_file_bytes(file_id: str) -> Optional[bytes]:
     """Read raw bytes for an OpenWebUI file, supporting any storage backend.
 
     Tries the row ``path``, meta paths, ``UPLOAD_DIR`` / ``/mnt/uploads``
@@ -438,7 +445,7 @@ def _read_owui_file_bytes(file_id: str) -> Optional[bytes]:
     if not file_id or _OwuiFiles is None:
         return None
     try:
-        file_row = _OwuiFiles.get_file_by_id(file_id)
+        file_row = await _maybe_await(_OwuiFiles.get_file_by_id(file_id))
     except Exception as exc:
         print(f"[documents] file: lookup failed for {file_id}: {exc}", file=sys.stderr)
         return None
@@ -469,7 +476,7 @@ def _read_owui_file_bytes(file_id: str) -> Optional[bytes]:
     for uri in remote_uris:
         cached_path: Optional[str] = None
         try:
-            cached_path = _OwuiStorage.get_file(uri)
+            cached_path = await _maybe_await(_OwuiStorage.get_file(uri))
             data = _read_bytes_from_path(cached_path or "")
             if data:
                 return data
@@ -520,12 +527,12 @@ def _file_entry_id_name(entry: Any) -> tuple[str, str]:
     return fid, name
 
 
-def _enrich_filename_from_owui(file_id: str) -> str:
+async def _enrich_filename_from_owui(file_id: str) -> str:
     """Best-effort filename lookup via OpenWebUI Files model."""
     if not file_id or not _HAS_OWUI_IMAGES or _OwuiFiles is None:
         return ""
     try:
-        row = _OwuiFiles.get_file_by_id(file_id)
+        row = await _maybe_await(_OwuiFiles.get_file_by_id(file_id))
     except Exception:
         return ""
     if not row:
@@ -538,7 +545,7 @@ def _enrich_filename_from_owui(file_id: str) -> str:
     return str(name or "").strip()
 
 
-def _chat_docx_files(
+async def _chat_docx_files(
     metadata: Any = None,
     files: Any = None,
 ) -> list[dict[str, str]]:
@@ -567,7 +574,7 @@ def _chat_docx_files(
         if not fid or fid in seen:
             continue
         if not name:
-            name = _enrich_filename_from_owui(fid)
+            name = await _enrich_filename_from_owui(fid)
         if not name or not _is_docx_name(name):
             continue
         seen.add(fid)
@@ -631,7 +638,6 @@ def _default_letterhead_dirs() -> list[str]:
     except Exception:
         pass
     dirs.append("/app/backend/data/uploads")
-    # de-dupe, preserve order
     seen: set[str] = set()
     out: list[str] = []
     for d in dirs:
@@ -764,7 +770,7 @@ def _looks_like_letterhead_chrome(text: str) -> bool:
         return False
     low = text.lower()
     needles = (
-        "p.iva", "p.iva", "partita iva", "c.f.", "codice fiscale",
+        "p.iva", "partita iva", "c.f.", "codice fiscale",
         "sede legale", "sede operativa", "rea ", "c.c.i.a.a",
         "tel.", "tel:", "fax", "pec:", "www.", "http",
         "@", "via ", "piazza ", "viale ", "corso ",
@@ -913,7 +919,7 @@ def _load_letterhead_doc(
     if data is None:
         if not file_id:
             raise ValueError("letterhead file id is empty")
-        data = _read_owui_file_bytes(file_id)
+        raise ValueError(f"letterhead file {file_id}: read its bytes first")
     if not data:
         raise ValueError(
             f"could not read letterhead file bytes"
@@ -939,7 +945,7 @@ def _load_letterhead_doc(
         raise ValueError(f"could not open letterhead .docx: {exc}") from exc
 
 
-def _resolve_letterhead_doc(
+async def _resolve_letterhead_doc(
     letterhead_name: str,
     metadata: Any = None,
     files: Any = None,
@@ -952,10 +958,10 @@ def _resolve_letterhead_doc(
     """
     errors: list[str] = []
     dirs = letterhead_dirs or _default_letterhead_dirs()
-    candidates = _chat_docx_files(metadata, files)
+    candidates = await _chat_docx_files(metadata, files)
     matched = _match_letterhead(letterhead_name, candidates)
     if matched:
-        data = _read_owui_file_bytes(matched["id"])
+        data = await _read_owui_file_bytes(matched["id"])
         if data:
             return _load_letterhead_doc(raw=data)
         errors.append(
@@ -1135,7 +1141,7 @@ async def _generate_image_via_openwebui(
 
     file_id_match = re.search(r"/files/([0-9a-fA-F-]{8,})/", url)
     if file_id_match:
-        data = _read_owui_file_bytes(file_id_match.group(1))
+        data = await _read_owui_file_bytes(file_id_match.group(1))
         if data:
             return data
         print(
@@ -1374,6 +1380,8 @@ def _resolve_theme(spec: dict) -> dict:
         "accent_soft": _lighten(accent, 0.88),   # faint tint for bands/panels
         "accent_tint": _lighten(accent, 0.80),   # slightly stronger tint
         "on_accent": _on_color(accent),          # text over a full accent fill
+        # second brand colour (cover stripe, header rule); the accent if unset
+        "accent2": _hex_clean(styles.get("accent_secondary") or accent),
         # Text
         "heading": heading,
         "ink": _INK,
@@ -1714,17 +1722,32 @@ def _yaml_safe_load(text: str) -> dict:
 # inline syntax ``~text~``. We only rewrite balanced pairs so partial
 # typos like ``==foo`` survive as plain text.
 _CRITIC_HIGHLIGHT_RE = re.compile(r"==([^=\n]+?)==")
+# Markdown line breaks inside an inline token: "  \n" or "\\\n" is a hard
+# break, any other "\n" is a soft wrap that reads as a space.
+_HARD_BREAK_RE = re.compile(r"(?: {2,}|\\)\n")
+
+
+def _md_softbreaks(text: str) -> str:
+    """Turn soft-wrapped lines back into one line, keeping hard breaks.
+
+    Models wrap Markdown at ~100 columns. A run with "\\n" becomes a Word line
+    break, so without this every wrapped paragraph showed ragged hard breaks.
+    """
+    if "\n" not in text:
+        return text
+    parts = _HARD_BREAK_RE.split(text)
+    return "\n".join(re.sub(r"[ \t]*\n[ \t]*", " ", p) for p in parts)
 
 
 def _md_inline_to_renderer(text: str) -> str:
     """Normalise inline markdown for the existing run renderers.
 
     The renderer's ``_iter_inline_runs`` already understands ``**bold**``,
-    ``*italic*``, `` `code` ``, and ``[link](url)``. We only need to map
-    the highlight syntax (``==x==`` -> ``~x~``) so the accent colour kicks
-    in. Everything else is passed through untouched.
+    ``*italic*``, `` `code` ``, and ``[link](url)``. We map the highlight
+    syntax (``==x==`` -> ``~x~``) so the accent colour kicks in, and fold
+    soft line wraps into spaces. Everything else is passed through untouched.
     """
-    return _CRITIC_HIGHLIGHT_RE.sub(r"~\1~", text)
+    return _CRITIC_HIGHLIGHT_RE.sub(r"~\1~", _md_softbreaks(text))
 
 
 # Attribute parser for fenced div info strings, e.g.
@@ -1829,6 +1852,8 @@ _FRONTMATTER_KEYS = {
     "accent", "accent_color", "accent_hex",
     # Company letterhead / sample .docx attached in chat (filename only).
     "letterhead", "sample", "base_docx",
+    # Client identity (preset name or map) and the language of tool labels.
+    "brand", "lang", "language",
 }
 
 
@@ -2004,7 +2029,9 @@ def _parse_blockquote(tokens: list, start: int) -> tuple[dict, int]:
         if title:
             block["title"] = title
         return block, i
-    return {"type": "quote", "text": _md_inline_to_renderer(full)}, i
+    # soft wraps fold per paragraph; paragraphs stay on lines of their own
+    text = "\n".join(_md_inline_to_renderer(p.strip()) for p in paragraphs if p.strip())
+    return {"type": "quote", "text": text}, i
 
 
 def _container_raw_body(open_token, src_lines: Optional[list]) -> str:
@@ -2450,6 +2477,79 @@ def _set_update_fields_on_open(doc: _DocxDocument) -> None:
     upd.set(qn("w:val"), "true")
     # Schema is permissive about position; appending is safe.
     settings_el.append(upd)
+
+
+# OOXML property containers are xsd:sequence: Word drops (or refuses) a child
+# that comes out of schema order, LibreOffice and previewers accept any order.
+# The helpers above append (shading before margins, tracking after size...), so
+# a final pass sorts every container back into schema order.
+_OOXML_SEQUENCES: dict[str, tuple[str, ...]] = {
+    "tcPr": ("cnfStyle", "tcW", "gridSpan", "hMerge", "vMerge", "tcBorders", "shd",
+             "noWrap", "tcMar", "textDirection", "tcFitText", "vAlign", "hideMark",
+             "headers", "cellIns", "cellDel", "cellMerge", "tcPrChange"),
+    "tblPr": ("tblStyle", "tblpPr", "tblOverlap", "bidiVisual", "tblStyleRowBandSize",
+              "tblStyleColBandSize", "tblW", "jc", "tblCellSpacing", "tblInd",
+              "tblBorders", "shd", "tblLayout", "tblCellMar", "tblLook", "tblCaption",
+              "tblDescription", "tblPrChange"),
+    "tcMar": ("top", "start", "left", "bottom", "end", "right"),
+    "tblCellMar": ("top", "start", "left", "bottom", "end", "right"),
+    "tcBorders": ("top", "start", "left", "bottom", "end", "right", "insideH",
+                  "insideV", "tl2br", "tr2bl"),
+    "pBdr": ("top", "left", "bottom", "right", "between", "bar"),
+    "pPr": ("pStyle", "keepNext", "keepLines", "pageBreakBefore", "framePr",
+            "widowControl", "numPr", "suppressLineNumbers", "pBdr", "shd", "tabs",
+            "suppressAutoHyphens", "kinsoku", "wordWrap", "overflowPunct",
+            "topLinePunct", "autoSpaceDE", "autoSpaceDN", "bidi", "adjustRightInd",
+            "snapToGrid", "spacing", "ind", "contextualSpacing", "mirrorIndents",
+            "suppressOverlap", "jc", "textDirection", "textAlignment",
+            "textboxTightWrap", "outlineLvl", "divId", "cnfStyle", "rPr", "sectPr",
+            "pPrChange"),
+    "rPr": ("rStyle", "rFonts", "b", "bCs", "i", "iCs", "caps", "smallCaps", "strike",
+            "dstrike", "outline", "shadow", "emboss", "imprint", "noProof",
+            "snapToGrid", "vanish", "webHidden", "color", "spacing", "w", "kern",
+            "position", "sz", "szCs", "highlight", "u", "effect", "bdr", "shd",
+            "fitText", "vertAlign", "rtl", "cs", "em", "lang", "eastAsianLayout",
+            "specVanish", "oMath", "rPrChange"),
+}
+
+
+def _fix_ooxml_order(doc: _DocxDocument, *, headers_footers: bool = True) -> None:
+    """Sort property children into schema order and align table grids with
+    the cells (body, nested tables, and the header/footer parts when they are
+    ours). Elements outside the sequence (extensions) keep their relative
+    order at the end."""
+    roots = [doc.element.body]
+    if headers_footers:
+        for s in doc.sections:
+            for part in (s.header, s.footer, s.first_page_header, s.first_page_footer):
+                if not part.is_linked_to_previous:
+                    roots.append(part._element)
+    ranks = {
+        qn("w:" + tag): {qn("w:" + c): i for i, c in enumerate(seq)}
+        for tag, seq in _OOXML_SEQUENCES.items()
+    }
+    for root in roots:
+        for el in list(root.iter(*ranks)):
+            rank = ranks[el.tag]
+            kids = list(el)
+            ordered = sorted(kids, key=lambda k: rank.get(k.tag, len(rank)))
+            if ordered != kids:
+                for k in kids:
+                    el.remove(k)
+                el.extend(ordered)
+        # grid = widths of the first row's own cells (Word follows the cells,
+        # LibreOffice and previewers the grid; panels and cards left it even)
+        for tbl in root.iter(qn("w:tbl")):
+            grid, tr = tbl.find(qn("w:tblGrid")), tbl.find(qn("w:tr"))
+            if grid is None or tr is None:
+                continue
+            cols, cells = grid.findall(qn("w:gridCol")), tr.findall(qn("w:tc"))
+            if len(cols) != len(cells):
+                continue
+            for col, tc in zip(cols, cells):
+                tcw = tc.find(qn("w:tcPr") + "/" + qn("w:tcW"))
+                if tcw is not None and tcw.get(qn("w:type")) == "dxa" and tcw.get(qn("w:w")):
+                    col.set(qn("w:w"), tcw.get(qn("w:w")))
 
 
 def _add_toc_field(paragraph, *, depth: int = 3) -> None:
@@ -3593,6 +3693,552 @@ def _clear_cell_borders(cell) -> None:
             tc_borders.append(b)
         b.set(qn("w:val"), "nil")
 
+
+# ── Brand: client identity (full-page cover, running header/footer) ─────────
+# Frontmatter ``brand:`` is a preset name (``<brands_dir>/<name>.json`` with
+# logos next to it) or an inline map {name, logo, logo_header, primary,
+# secondary, prepared_by}. With a brand, a cover becomes a full-bleed section
+# (colour band, logo, a grid of ``cover.meta`` fields) and every later page
+# gets the logo + title header and a "page X of Y" footer.
+
+_LABELS: dict[str, dict[str, str]] = {
+    "it": {
+        "date": "Data",
+        "page": "Pag. {page} di {pages}",
+        "prepared": "Documento elaborato con {by}",
+        "credit": "{name} · elaborato con {by}",
+    },
+    "en": {
+        "date": "Date",
+        "page": "Page {page} of {pages}",
+        "prepared": "Prepared with {by}",
+        "credit": "{name} · prepared with {by}",
+    },
+}
+_MONTHS: dict[str, tuple[str, ...]] = {
+    "it": ("gennaio", "febbraio", "marzo", "aprile", "maggio", "giugno", "luglio",
+           "agosto", "settembre", "ottobre", "novembre", "dicembre"),
+    "en": ("January", "February", "March", "April", "May", "June", "July",
+           "August", "September", "October", "November", "December"),
+}
+_BRAND_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,80}$")
+
+
+def _is_neutral(color: str) -> bool:
+    """Black, white or a grey: no hue to speak of."""
+    rgb = _hex_to_rgb(color)
+    return max(rgb) - min(rgb) < 28
+
+
+def _lang_key(lang: Optional[str]) -> str:
+    return "it" if str(lang or "").lower().startswith("it") else "en"
+
+
+def _today_label(lang: Optional[str]) -> str:
+    import datetime
+
+    d = datetime.date.today()
+    return f"{d.day} {_MONTHS[_lang_key(lang)][d.month - 1]} {d.year}"
+
+
+def _brand_presets(brands_dir: str) -> list[str]:
+    try:
+        names = os.listdir(brands_dir)
+    except OSError:
+        return []
+    return sorted(
+        n[:-5] if n.endswith(".json") else n
+        for n in names
+        if n.endswith(".json") or os.path.isfile(os.path.join(brands_dir, n, "brand.json"))
+    )
+
+
+_IMAGE_EXTS = (".png", ".jpg", ".jpeg", ".webp", ".gif", ".bmp")
+
+
+async def _read_terminal_file(
+    path: str, *, request: Any, user_dict: Any, metadata: Any,
+) -> Optional[bytes]:
+    """Read an image from the user's terminal (Open Terminal ``/files/read``).
+
+    With the terminal's ``chat_uploads: filesystem`` a file attached in chat
+    lands in the user's terminal home, not in OpenWebUI's files. Same route,
+    headers and access check OpenWebUI uses for the terminal; None outside
+    OpenWebUI, without a terminal in this chat, or when it is not an image.
+    """
+    metadata = metadata if isinstance(metadata, dict) else {}
+    terminal_id = metadata.get("terminal_id")
+    if not (path and terminal_id and request and user_dict):
+        return None
+    try:
+        import aiohttp  # type: ignore
+        from urllib.parse import quote
+
+        from open_webui.models.config import Config  # type: ignore
+        from open_webui.models.groups import Groups  # type: ignore
+        from open_webui.models.users import UserModel  # type: ignore
+        from open_webui.utils import terminals as _terminals  # type: ignore
+        from open_webui.utils.access_control import has_connection_access  # type: ignore
+        from open_webui.utils.tools import build_tool_server_headers  # type: ignore
+    except Exception:
+        return None
+    try:
+        user = user_dict if isinstance(user_dict, UserModel) else UserModel(**user_dict)
+        connections = await Config.get("terminal_server.connections", []) or []
+        conn = next((c for c in connections if c.get("id") == terminal_id), None)
+        if not conn or not conn.get("enabled", True):
+            return None
+        group_ids = {
+            g.id for g in await Groups.get_groups_by_member_id(user.id, include_inherited=True)
+        }
+        if not await has_connection_access(user, conn, group_ids):
+            return None
+        headers, cookies = await build_tool_server_headers(conn, request, user, metadata=metadata)
+        headers["X-User-Id"] = user.id
+        if metadata.get("chat_id"):
+            headers["X-Session-Id"] = metadata["chat_id"]
+        context_id = _terminals.terminal_context_id(conn, metadata, "chat")
+        if context_id:
+            headers[_terminals.TERMINAL_CONTEXT_HEADER] = context_id
+        url = (
+            f"{_terminals.get_terminal_server_url(conn)}/files/read"
+            f"?path={quote(path, safe='')}"
+        )
+        timeout = aiohttp.ClientTimeout(total=20)
+        async with aiohttp.ClientSession(timeout=timeout, trust_env=True) as session:
+            async with session.get(
+                url, headers=headers, cookies=cookies, allow_redirects=False,
+            ) as resp:
+                if resp.status == 200 and resp.content_type.startswith("image/"):
+                    return await resp.read()
+                print(f"[documents] brand: terminal read {path} -> HTTP {resp.status} "
+                      f"{resp.content_type}", file=sys.stderr)
+    except Exception as exc:
+        print(f"[documents] brand: terminal read {path} failed: {exc}", file=sys.stderr)
+    return None
+
+
+def _chat_images(metadata: Any = None, files: Any = None, messages: Any = None) -> list[dict]:
+    """Images attached to the chat: {name, path} for files in the user's
+    terminal, {name, id} for OpenWebUI files, {name, data} for inline ones
+    (an image pasted in a message travels as an ``image_url`` part)."""
+    raw: list = []
+    for src in (files, (metadata or {}).get("files") if isinstance(metadata, dict) else None):
+        if isinstance(src, list):
+            raw.extend(src)
+    for msg in reversed(messages if isinstance(messages, list) else []):
+        content = msg.get("content") if isinstance(msg, dict) and msg.get("role") == "user" else None
+        for part in content if isinstance(content, list) else []:
+            if isinstance(part, dict) and part.get("type") == "image_url":
+                url = (part.get("image_url") or {}).get("url") or ""
+                raw.append({"type": "image", "url": url})
+    out: list[dict] = []
+    seen: set = set()
+    for e in raw:
+        if not isinstance(e, dict):
+            continue
+        nested = e.get("file") if isinstance(e.get("file"), dict) else {}
+        name = str(e.get("name") or nested.get("filename") or nested.get("name") or "")
+        url = str(e.get("url") or "")
+        if e.get("type") == "filesystem":
+            path = str(e.get("path") or nested.get("path") or "")
+            item = {"name": name or os.path.basename(path), "path": path}
+        elif url.startswith("data:image/"):
+            item = {"name": name, "data": url}
+        else:
+            fid, fname = _file_entry_id_name(e)
+            m = re.search(r"/files/([0-9a-fA-F-]{8,})", url)
+            item = {"name": name or fname, "id": fid or (m.group(1) if m else "")}
+        is_image = (
+            e.get("type") == "image" or "data" in item
+            or item["name"].lower().endswith(_IMAGE_EXTS)
+        )
+        key = item.get("path") or item.get("id") or item.get("data")
+        if is_image and key and key not in seen:
+            seen.add(key)
+            out.append(item)
+    return out
+
+
+async def _brand_asset(src: Any, base_dir: str, ctx: Optional[dict] = None) -> Optional[bytes]:
+    """Logo bytes from, in order: a data URI / base64, an http(s) URL, a file
+    of the preset's own directory, an image attached to the chat (by name),
+    a path in the user's terminal (attachments, Nextcloud sync, work folders).
+
+    Without ``src`` (or when nothing matches) the image attached to the chat
+    is used: one image, or the one with "logo" in its name."""
+    ctx = ctx or {}
+    s = str(src or "").strip()
+    if s.startswith("data:") or len(s) > 512:
+        return _b64_decode_lenient(s)
+    if s.startswith(("http://", "https://")):
+        return await _fetch_image_url(s)
+    if s and base_dir:
+        root = os.path.realpath(base_dir)
+        path = os.path.realpath(os.path.join(root, s))
+        if path.startswith(root + os.sep) and os.path.isfile(path):
+            return _read_bytes_from_path(path)
+
+    images = _chat_images(ctx.get("metadata"), ctx.get("files"), ctx.get("messages"))
+    want = os.path.basename(s).lower()
+    match = None
+    if want:
+        match = next((i for i in images if i["name"].lower() == want), None) or next(
+            (i for i in images if os.path.splitext(i["name"].lower())[0]
+             == os.path.splitext(want)[0]), None)
+    if match is None and s and not images:
+        match = {"path": s}  # not an attachment: a file in the user's terminal
+    if match is None and images:
+        logos = [i for i in images if "logo" in i["name"].lower()]
+        if len(images) == 1 or len(logos) == 1:
+            match = images[0] if len(images) == 1 else logos[0]
+    if match is None and s:
+        match = {"path": s}
+    if match is None:
+        return None
+    if match.get("data"):
+        return _b64_decode_lenient(match["data"])
+    if match.get("id"):
+        data = await _read_owui_file_bytes(match["id"])
+        if data:
+            return data
+    if match.get("path"):
+        return await _read_terminal_file(
+            match["path"], request=ctx.get("request"),
+            user_dict=ctx.get("user"), metadata=ctx.get("metadata"),
+        )
+    return None
+
+
+async def _load_brand(value: Any, brands_dir: str, ctx: Optional[dict] = None) -> dict:
+    """Resolve frontmatter ``brand`` into colours + logo bytes.
+
+    Raises ValueError (listing the presets) when a named preset is missing,
+    so the model gets a usable message instead of an unbranded document.
+    ``ctx`` ({request, user, metadata, files}) lets a logo come from the chat
+    attachments or the user's terminal."""
+    base = brands_dir or ""
+    if isinstance(value, str):
+        name = value.strip()
+        if name.lower().endswith(".json"):
+            name = name[:-5]
+        found = None
+        if base and _BRAND_NAME_RE.match(name):
+            for cand in (os.path.join(base, name + ".json"),
+                         os.path.join(base, name, "brand.json")):
+                if os.path.isfile(cand):
+                    found = cand
+                    break
+        if not found:
+            presets = _brand_presets(base) if base else []
+            raise ValueError(
+                f"brand '{value}' not found"
+                + (f"; available: {', '.join(presets)}" if presets else
+                   "; no brand presets are installed (pass brand as a map)")
+            )
+        with open(found, encoding="utf-8") as fh:
+            data = json.load(fh)
+        base = os.path.dirname(found)
+    elif isinstance(value, dict):
+        data = dict(value)
+    else:
+        raise ValueError("brand must be a preset name or a map")
+    primary = _hex_clean(data.get("primary") or data.get("accent") or DEFAULT_ACCENT)
+    brand = {
+        "name": str(data.get("name") or ""),
+        "primary": primary,
+        "secondary": _hex_clean(data.get("secondary") or primary),
+        "prepared_by": str(data.get("prepared_by") or ""),
+        "logo": await _brand_asset(data.get("logo"), base, ctx),
+        "_loaded": True,
+    }
+    brand["logo_header"] = (
+        data.get("logo_header") and await _brand_asset(data["logo_header"], base, ctx)
+    ) or brand["logo"]
+    if not brand["logo"]:
+        print(f"[documents] brand: no logo for {data.get('logo')!r}", file=sys.stderr)
+    return brand
+
+
+def _cover_meta(cover: dict) -> list[tuple[str, str]]:
+    """``cover.meta`` as (label, value) pairs: a map, a list of maps /
+    "Label: value" strings, or one "A=1; B=2" string."""
+    raw = cover.get("meta") or cover.get("fields") or []
+    items: list = []
+    if isinstance(raw, dict):
+        items = list(raw.items())
+    elif isinstance(raw, str):
+        raw = [x for x in re.split(r"\s*;\s*", raw) if x]
+    if isinstance(raw, list):
+        for x in raw:
+            if isinstance(x, dict):
+                if "label" in x:
+                    items.append((x.get("label"), x.get("value")))
+                else:
+                    items.extend(x.items())
+            elif isinstance(x, str):
+                k, sep, v = x.partition("=") if "=" in x else x.partition(":")
+                if sep:
+                    items.append((k, v))
+    return [
+        (_smart_quotes(str(k).strip()), _smart_quotes(str(v).strip()))
+        for k, v in items
+        if str(k or "").strip() and str(v or "").strip()
+    ]
+
+
+def _add_picture_mm(paragraph, raw: bytes, height_mm: float) -> None:
+    try:
+        norm, _ = _normalise_image_bytes(raw, max_width_px=1200)
+        paragraph.add_run().add_picture(BytesIO(norm), height=Mm(height_mm))
+    except Exception:
+        traceback.print_exc()
+
+
+def _build_brand_cover(doc: _DocxDocument, cover: dict, brand: dict, *, lang: str) -> None:
+    """Full-bleed cover: colour band with kicker/title/subtitle, a stripe in
+    the second colour, logo + a 2-column grid of meta fields, credit line.
+
+    It is a 4-row page-wide table with exact row heights, so it always fills
+    exactly one page; ``_close_brand_cover`` later turns the paragraph after
+    it into its own zero-margin section. Text is inset with paragraph indents,
+    not cell margins: Word takes cell margins off a page-wide table's width
+    (the band stopped short of the right edge) and they did not move the text.
+    """
+    theme = _theme(doc)
+    labels = _LABELS[_lang_key(lang)]
+    primary, secondary = brand["primary"], brand["secondary"]
+    # a black/graphite brand fills the band with a pale grey and writes in its
+    # colour: a page-wide black block reads as heavy, not as a brand
+    neutral = _is_neutral(primary) and _relative_luminance(primary) < 0.08
+    band_fill = _lighten(primary, 0.95) if neutral else primary
+    on_band = primary if neutral else _on_color(primary)
+    dark_band = _on_color(band_fill) == "FFFFFF"
+    soft = _lighten(primary, 0.78) if dark_band else theme["ink_soft"]
+    if dark_band:
+        kicker_ink = _lighten(secondary, 0.7)
+    else:
+        kicker_ink = theme["ink_muted"] if _is_neutral(secondary) else secondary
+    stripe_fill, stripe_h = (primary, 1.2) if neutral else (secondary, 3.5)
+    muted = theme["ink_muted"]
+
+    title = _smart_quotes(cover.get("title") or "")
+    subtitle = _smart_quotes(cover.get("subtitle") or "")
+    kicker = _smart_quotes(
+        cover.get("kicker") or cover.get("eyebrow") or cover.get("doc_type")
+        or brand.get("name") or ""
+    )
+    meta = _cover_meta(cover)
+    if not any(k.lower() in ("data", "date") for k, _ in meta):
+        meta.append((labels["date"], _smart_quotes(str(cover.get("date") or _today_label(lang)))))
+
+    section = doc.sections[-1]
+    page_w_dxa = int(int(section.page_width) * 1440 / 914400)
+    page_h_mm = int(section.page_height) / 36000
+    side = 1300  # text inset, DXA (~23 mm)
+    side_mm = Mm(side / 1440 * 25.4)
+    grid_rows = (len(meta) + 1) // 2
+    # exact heights keep the cover on one page: the band gives way to the
+    # grid, ~19 mm per row of two-line values
+    band_h = max(105, min(150, 205 - 19 * grid_rows))
+    logo_h = 26 if grid_rows <= 2 else 20
+    heights = (band_h, stripe_h, page_h_mm - band_h - stripe_h - 22 - 2, 22)
+
+    def run(p, text, *, size, color, bold=False, caps=False, track=0):
+        r = p.add_run(text)
+        r.font.size = Pt(size)
+        r.font.color.rgb = _rgb(color)
+        r.bold = bold
+        r.font.all_caps = caps
+        if track:
+            _set_run_tracking(r, track)
+        return r
+
+    def spacing(p, before=0, after=0, line=None):
+        f = p.paragraph_format
+        f.space_before, f.space_after = Pt(before), Pt(after)
+        if line:
+            f.line_spacing = line
+
+    table = doc.add_table(rows=4, cols=1)
+    table.autofit = False
+    _set_table_width(table, page_w_dxa)
+    table._tbl.tblGrid.find(qn("w:gridCol")).set(qn("w:w"), str(page_w_dxa))
+    for row, h, fill in zip(table.rows, heights, (band_fill, stripe_fill, None, None)):
+        _set_row_height(row, h * 72 / 25.4, exact=True)
+        c = row.cells[0]
+        c.width = section.page_width
+        _clear_cell_borders(c)
+        _set_cell_margins(c, top=0, bottom=0, left=0, right=0)
+        if fill:
+            _set_cell_shading(c, fill)
+    band, _stripe, mid, foot = (r.cells[0] for r in table.rows)
+
+    band.vertical_alignment = WD_ALIGN_VERTICAL.BOTTOM
+    p = band.paragraphs[0]
+    if kicker:
+        spacing(p, after=10)
+        run(p, kicker, size=10, color=kicker_ink, bold=True, caps=True, track=40)
+        p = band.add_paragraph()
+    spacing(p, after=8, line=1.05)
+    run(p, title, size=30 if len(title) < 70 else 24, color=on_band, bold=True)
+    if subtitle:
+        p = band.add_paragraph()
+        spacing(p, line=1.2)
+        run(p, subtitle, size=13, color=soft)
+    p = band.add_paragraph()  # short accent rule under the title block
+    spacing(p, before=16, after=40)
+    p.paragraph_format.right_indent = Mm(120)
+    _set_paragraph_bottom_border(p, color=secondary, size_pt=24)
+
+    mid.vertical_alignment = WD_ALIGN_VERTICAL.TOP
+    p = mid.paragraphs[0]
+    spacing(p, before=34 if grid_rows <= 2 else 22, after=26 if grid_rows <= 2 else 14)
+    if brand.get("logo"):
+        _add_picture_mm(p, brand["logo"], logo_h)
+    inner = page_w_dxa - 2 * side
+    grid = mid.add_table(rows=grid_rows, cols=2)
+    grid.autofit = False
+    _set_table_width(grid, inner)
+    ind = OxmlElement("w:tblInd")
+    ind.set(qn("w:w"), str(side))
+    ind.set(qn("w:type"), "dxa")
+    grid._tbl.tblPr.append(ind)
+    for col in grid._tbl.tblGrid.findall(qn("w:gridCol")):
+        col.set(qn("w:w"), str(inner // 2))
+    for c in grid._cells:
+        c.width = Emu(int(inner / 2 * 914400 / 1440))
+        _clear_cell_borders(c)
+        _set_cell_margins(c, top=0, bottom=160, left=0, right=200)
+    for i, (k, v) in enumerate(meta):
+        c = grid.rows[i // 2].cells[i % 2]
+        lp = c.paragraphs[0]
+        spacing(lp, after=1)
+        run(lp, k, size=8, color=muted, bold=True, caps=True, track=20)
+        vp = c.add_paragraph()
+        spacing(vp, line=1.1)
+        run(vp, v, size=11, color=primary, bold=True)
+
+    foot.vertical_alignment = WD_ALIGN_VERTICAL.CENTER
+    p = foot.paragraphs[0]
+    if brand.get("prepared_by"):
+        run(p, labels["prepared"].format(by=brand["prepared_by"]), size=8, color=muted)
+    if brand.get("name"):
+        p.paragraph_format.tab_stops.add_tab_stop(
+            # tab stops count from the cell edge, not from the indent
+            Emu(int((page_w_dxa - side) * 914400 / 1440)), WD_TAB_ALIGNMENT.RIGHT,
+        )
+        run(p, "\t" + brand["name"], size=8, color=muted, bold=True)
+
+    for cell in (band, mid, foot):
+        for par in cell.paragraphs:  # the cell's own paragraphs, not the grid's
+            par.paragraph_format.left_indent = side_mm
+            if par.paragraph_format.right_indent is None:
+                par.paragraph_format.right_indent = side_mm
+
+    # the paragraph that will carry the cover's section break (it must not
+    # add a line of its own on the cover page)
+    brk = doc.add_paragraph()
+    brk.paragraph_format.space_before = Pt(0)
+    brk.paragraph_format.space_after = Pt(0)
+    rpr = OxmlElement("w:rPr")
+    sz = OxmlElement("w:sz")
+    sz.set(qn("w:val"), "2")
+    rpr.append(sz)
+    brk._p.get_or_add_pPr().append(rpr)
+    doc._neura_cover_break = brk._p  # type: ignore[attr-defined]
+
+
+def _close_brand_cover(doc: _DocxDocument) -> None:
+    """Make the cover its own section: zero margins (the band reaches the page
+    edges) and no header/footer. Run last, once the body section is final."""
+    brk = getattr(doc, "_neura_cover_break", None)
+    if brk is None:
+        return
+    sect = deepcopy(doc.element.body.find(qn("w:sectPr")))
+    for tag in ("w:headerReference", "w:footerReference", "w:titlePg", "w:pgNumType"):
+        for el in sect.findall(qn(tag)):
+            sect.remove(el)
+    mar = sect.find(qn("w:pgMar"))
+    if mar is not None:
+        for k in ("top", "bottom", "left", "right", "header", "footer", "gutter"):
+            mar.set(qn(f"w:{k}"), "0")
+    brk.get_or_add_pPr().append(sect)
+
+
+def _build_brand_header_footer(
+    doc: _DocxDocument, brand: dict, *, title: str, lang: str,
+    header: bool = True, footer: bool = True,
+) -> None:
+    """Header: logo left, document title right, a rule in the second colour.
+    Footer: "<name> · prepared with <by>" left, "Page X of Y" right.
+
+    Both are borderless 1x2 tables: header/footer paragraph styles carry their
+    own tab stops, so a right-hand text on a tab landed mid-line. Pages count
+    from the cover (PAGE / NUMPAGES): SECTIONPAGES would leave it out, but
+    LibreOffice and most previewers keep its placeholder.
+    """
+    theme = _theme(doc)
+    labels = _LABELS[_lang_key(lang)]
+    muted = theme["ink_muted"]
+    section = doc.sections[-1]
+    section.different_first_page_header_footer = False
+    width = int(section.page_width) - int(section.left_margin) - int(section.right_margin)
+
+    def two_cols(part, left_share: float):
+        part.is_linked_to_previous = False
+        t = part.add_table(rows=1, cols=2, width=Emu(width))
+        t.autofit = False
+        _set_table_width(t, int(width * 1440 / 914400))
+        widths = (int(width * left_share), width - int(width * left_share))
+        for col, w in zip(t._tbl.tblGrid.findall(qn("w:gridCol")), widths):
+            col.set(qn("w:w"), str(int(w * 1440 / 914400)))
+        cells = t.rows[0].cells
+        for c, w in zip(cells, widths):
+            c.width = Emu(w)
+            _clear_cell_borders(c)
+            _set_cell_margins(c, top=0, bottom=0, left=0, right=0)
+            c.vertical_alignment = WD_ALIGN_VERTICAL.BOTTOM
+            c.paragraphs[0].paragraph_format.space_after = Pt(0)
+        cells[1].paragraphs[0].alignment = WD_ALIGN_PARAGRAPH.RIGHT
+        empty = part.paragraphs[0]  # the default paragraph stays above the table
+        empty._p.getparent().remove(empty._p)
+        return cells
+
+    def small(p, text, bold=False):
+        r = p.add_run(text)
+        r.font.size = Pt(8)
+        r.font.color.rgb = _rgb(muted)
+        r.bold = bold
+
+    if header:
+        left, right = two_cols(section.header, 0.4)
+        if brand.get("logo_header"):
+            _add_picture_mm(left.paragraphs[0], brand["logo_header"], 9)
+        small(right.paragraphs[0], title)
+        rule = section.header.add_paragraph()
+        rule.paragraph_format.space_before = Pt(0)
+        rule.paragraph_format.space_after = Pt(0)
+        rule.add_run().font.size = Pt(4)  # a near-empty line carrying the rule
+        _set_paragraph_bottom_border(rule, color=theme["accent2"], size_pt=8)
+        # room for the 9 mm logo and the rule above the text
+        section.header_distance = Mm(10)
+        section.top_margin = max(section.top_margin, Mm(30))
+    if footer:
+        left, right = two_cols(section.footer, 0.75)
+        if brand.get("name") and brand.get("prepared_by"):
+            small(left.paragraphs[0], labels["credit"].format(
+                name=brand["name"], by=brand["prepared_by"]))
+        elif brand.get("name") or brand.get("prepared_by"):
+            small(left.paragraphs[0], brand.get("name") or brand["prepared_by"])
+        rp = right.paragraphs[0]
+        _footer_add_pagenum_runs(rp, labels["page"], muted)
+        for r in rp.runs:
+            r.font.size = Pt(8)
+            r.font.color.rgb = _rgb(muted)
+        section.footer_distance = Mm(10)
+        section.bottom_margin = max(section.bottom_margin, Mm(22))
+
 # endregion
 
 
@@ -3633,6 +4279,7 @@ def _add_inline_runs(paragraph, text: str, *, accent_rgb: tuple[int, int, int]) 
                     rpr.insert(0, rfonts)
                 rfonts.set(qn("w:ascii"), "Consolas")
                 rfonts.set(qn("w:hAnsi"), "Consolas")
+                # Light grey background for inline code
                 shd = OxmlElement("w:shd")
                 shd.set(qn("w:val"), "clear")
                 shd.set(qn("w:color"), "auto")
@@ -3954,6 +4601,23 @@ def _strip_md_emphasis(text: str) -> str:
     return t.strip()
 
 
+def _content_column_pcts(headers: list, rows: list, num_cols: int) -> list[float]:
+    """Column widths (percent) from content length: long text gets room,
+    codes and amounts stay narrow. The square root keeps a 300-char column
+    from crushing the others; the 80th percentile ignores one huge cell."""
+    table = [headers or []] + list(rows)
+
+    def weight(c: int) -> float:
+        lens = sorted(
+            len(_strip_md_emphasis(str(r[c]))) if c < len(r) else 0 for r in table
+        )
+        typical = lens[int(len(lens) * 0.8)] if lens else 0
+        return max(min(typical, 90), 6) ** 0.5
+
+    w = [weight(c) for c in range(num_cols)]
+    return [100 * x / sum(w) for x in w]
+
+
 def _set_cell_valign(cell, where: str = "center") -> None:
     try:
         cell.vertical_alignment = {
@@ -4055,10 +4719,10 @@ def _render_table(
     header_fill = theme["accent"]
     header_ink = theme["on_accent"]
 
-    # Column widths
-    pcts = block.get("column_widths_pct") or [round(100 / num_cols, 4)] * num_cols
+    # Column widths: explicit percentages, else from the content
+    pcts = block.get("column_widths_pct") or []
     if len(pcts) != num_cols:
-        pcts = [round(100 / num_cols, 4)] * num_cols
+        pcts = _content_column_pcts(headers, rows, num_cols)
     col_widths_dxa = [int(total_dxa * p / 100) for p in pcts]
     col_widths_dxa[-1] += total_dxa - sum(col_widths_dxa)
 
@@ -4170,6 +4834,11 @@ def _render_table(
             if is_total:
                 for r in p.runs:
                     r.bold = True
+
+    # the grid python-docx wrote is an even split: Word follows the cells,
+    # LibreOffice and most previewers follow the grid
+    for col, w in zip(table._tbl.tblGrid.findall(qn("w:gridCol")), col_widths_dxa):
+        col.set(qn("w:w"), str(w))
 
     caption = block.get("caption")
     if caption:
@@ -4506,10 +5175,19 @@ def _render_quote(doc: _DocxDocument, block: dict, *, accent_rgb) -> None:
     p.paragraph_format.space_after = Pt(6)
     p.paragraph_format.line_spacing = 1.28
     _set_paragraph_left_border(p, color=theme["accent"], size_pt=28)
-    run = p.add_run("\u201C" + _smart_quotes(text) + "\u201D")
-    run.italic = True
-    run.font.size = Pt(theme["size_pt"] + 2)
-    run.font.color.rgb = _rgb(theme["ink"])
+    # inline runs, so **bold** inside an excerpt renders instead of showing
+    # its asterisks; one line per quoted paragraph
+    p.add_run("\u201C")
+    for n, line in enumerate(_smart_quotes(text).split("\n")):
+        if n:
+            p.add_run().add_break()
+        _add_inline_runs(p, line, accent_rgb=accent_rgb)
+    p.add_run("\u201D")
+    for run in p.runs:
+        run.italic = True
+        run.font.size = Pt(theme["size_pt"] + 2)
+        if run.font.color.rgb is None:
+            run.font.color.rgb = _rgb(theme["ink"])
     if attribution:
         ap = doc.add_paragraph()
         ap.paragraph_format.left_indent = Mm(12)
@@ -4724,6 +5402,51 @@ SYNC_BLOCK_TYPES = {
 ASYNC_BLOCK_TYPES = {"image", "figure"}
 
 
+def _btype(blk: Any) -> str:
+    return (blk.get("type") or "").lower().strip() if isinstance(blk, dict) else ""
+
+
+def _tidy_blocks(spec: dict, *, has_cover: bool) -> None:
+    """Undo two habits of models writing reports, in place on ``spec``.
+
+    - A ``---`` right before a heading, or at the start or end, doubles the
+      rule the heading style already draws: drop it.
+    - With a cover, one ``#`` wrapping the whole document (its sections as
+      ``##``) numbers everything 1.1, 1.2...: that heading becomes the cover
+      subtitle (or is dropped when it repeats the title) and the rest move
+      up one level.
+    """
+    blocks = [b for b in (spec.get("blocks") or []) if isinstance(b, dict)]
+    rules = ("horizontal_rule", "hr", "rule", "divider")
+    tidy: list = []
+    for i, blk in enumerate(blocks):
+        if _btype(blk) in rules:
+            nxt = next((b for b in blocks[i + 1:] if _btype(b) not in rules), None)
+            if not tidy or nxt is None or _btype(nxt) == "heading":
+                continue
+            if _btype(tidy[-1]) in rules:
+                continue
+        tidy.append(blk)
+    heads = [b for b in tidy if _btype(b) == "heading"]
+    top = [b for b in heads if int(b.get("level") or 1) == 1]
+    if (
+        has_cover and len(top) == 1 and heads and heads[0] is top[0]
+        and sum(1 for b in heads if int(b.get("level") or 1) == 2) >= 2
+    ):
+        h1 = top[0]
+        text = _strip_md_emphasis(str(h1.get("text") or "")).strip()
+        title = _strip_md_emphasis(str(_document_title(spec))).strip()
+        cover = spec.get("cover") if isinstance(spec.get("cover"), dict) else {}
+        if text and text.lower() != title.lower() and not (
+            spec.get("subtitle") or cover.get("subtitle")
+        ):
+            spec["subtitle"] = text
+        tidy.remove(h1)
+        for b in heads[1:]:
+            b["level"] = max(1, int(b.get("level") or 1) - 1)
+    spec["blocks"] = tidy
+
+
 def _normalise_page_breaks(blocks: list) -> list:
     """Drop redundant page breaks that would emit blank pages.
 
@@ -4853,7 +5576,7 @@ def _document_title(spec: dict) -> str:
     )
 
 
-def _tool_success_reply(fname: str, download_url: str) -> str:
+def _tool_success_reply(fname: str, download_url: str, *, note: str = "") -> str:
     """Build the tool return string after a successful save.
 
     Verbatim-copy and anti-summary rules live **here** (in the tool
@@ -4874,6 +5597,7 @@ def _tool_success_reply(fname: str, download_url: str) -> str:
         "---\n\n"
         "If you output anything outside the dashed block, the user may lose "
         "the clickable download link."
+        + (f"\n\nNOTE: {note}" if note else "")
     )
 
 
@@ -4941,6 +5665,22 @@ class Tools:
                 " /app/backend/data/uploads)."
             ),
         )
+        brands_dir: str = Field(
+            default="/app/backend/data/brands",
+            description=(
+                "Directory of brand presets for frontmatter `brand: <name>`:"
+                " <name>.json ({name, logo, logo_header, primary, secondary,"
+                " prepared_by}) with the logo files next to it."
+            ),
+        )
+        language: str = Field(
+            default="it",
+            description=(
+                "Language of the labels the tool writes itself (cover date,"
+                " 'page X of Y', credit line): it or en. Frontmatter `lang`"
+                " overrides it per document."
+            ),
+        )
 
     def __init__(self):
         self.valves = self.Valves()
@@ -4960,6 +5700,7 @@ class Tools:
         __user__=None,
         __metadata__=None,
         __files__=None,
+        __messages__=None,
     ) -> str:
         """Generate a Word (.docx) document from a structured spec.
 
@@ -5014,6 +5755,11 @@ class Tools:
            execute_code/python-docx; call this tool with ``letterhead`` set.
            Do not use a programmatic cover with a letterhead.
 
+           Client brand: ``brand: <preset>`` (``brands_dir`` valve) or an
+           inline map {name, logo, logo_header, primary, secondary,
+           prepared_by}; ``cover.kicker`` and ``cover.meta`` fill the branded
+           cover, ``lang: it|en`` the labels.
+
         2. **JSON** (legacy, fully supported): an object with the
            ``title/template/page/styles/header/footer/cover/blocks`` shape
            described in the tool descriptor.
@@ -5042,9 +5788,14 @@ class Tools:
                 "with YAML frontmatter."
             )
 
-        # Apply default template when the spec doesn't declare one
-        spec_raw.setdefault("template", self.valves.default_template)
-        spec = _resolve_template(spec_raw)
+        try:
+            spec = await self._prepare_spec(spec_raw, ctx={
+                "request": __request__, "user": __user__,
+                "metadata": __metadata__, "files": __files__,
+                "messages": __messages__,
+            })
+        except ValueError as exc:
+            return self._error_reply(str(exc))
 
         await self._emit_status(__event_emitter__, "Building Word document...", done=False)
 
@@ -5076,7 +5827,7 @@ class Tools:
         docx_bytes = buf.getvalue()
 
         await self._emit_status(__event_emitter__, "Saving file...", done=False)
-        fname, download_url, save_err = self._save_docx(
+        fname, download_url, save_err = await self._save_docx(
             docx_bytes,
             title=_document_title(spec),
             request=__request__,
@@ -5103,9 +5854,41 @@ class Tools:
         # model does not see side-channel emitter events). Instructions for
         # what to say next MUST live here — not in the global LLM system
         # prompt — so open-source deployments stay self-contained.
-        return _tool_success_reply(fname, download_url)
+        note = ""
+        brand = spec.get("brand") if isinstance(spec.get("brand"), dict) else None
+        if brand and not brand.get("logo"):
+            # said here, so the model retries with a logo instead of
+            # rebuilding the document by hand
+            note = (
+                "The brand logo was not found, so the document has none. To add "
+                "it, call generate_document again with `brand.logo` set to the "
+                "file name of the image attached in chat, a path in the user's "
+                "terminal, or a URL. Do not build the Word file another way."
+            )
+        return _tool_success_reply(fname, download_url, note=note)
 
     # ── Build pipeline ───────────────────────────────────────────────────────
+    async def _prepare_spec(self, spec_raw: dict, *, ctx: Optional[dict] = None) -> dict:
+        """Default template, brand preset, template merge.
+
+        The brand is loaded before the merge so its primary colour becomes
+        the accent unless the author set one, and so we still know whether
+        the author wrote a header/footer (the template always brings one)."""
+        spec_raw.setdefault("template", self.valves.default_template)
+        if spec_raw.get("brand"):
+            brand = await _load_brand(spec_raw["brand"], self.valves.brands_dir, ctx)
+            styles = spec_raw.get("styles")
+            styles = dict(styles) if isinstance(styles, dict) else {}
+            if not any((styles.get("accent"), styles.get("accent_color"),
+                        spec_raw.get("accent"), spec_raw.get("accent_color"))):
+                styles["accent"] = "#" + brand["primary"]
+            styles.setdefault("accent_secondary", "#" + brand["secondary"])
+            spec_raw["styles"] = styles
+            brand["own_header"] = "header" not in spec_raw
+            brand["own_footer"] = "footer" not in spec_raw
+            spec_raw["brand"] = brand
+        return _resolve_template(spec_raw)
+
     async def _build_document(
         self,
         spec: dict,
@@ -5125,7 +5908,7 @@ class Tools:
             if letterhead_raw is not None:
                 doc = _load_letterhead_doc(raw=letterhead_raw)
             else:
-                doc = _resolve_letterhead_doc(
+                doc = await _resolve_letterhead_doc(
                     letterhead_name,
                     metadata=metadata,
                     files=files,
@@ -5175,6 +5958,16 @@ class Tools:
 
         accent_hex = theme["accent"]
         accent_rgb = _hex_to_rgb(accent_hex)
+        # loaded by _prepare_spec (logo bytes, colours); ignored with a
+        # letterhead, whose header and footer belong to the company file
+        brand = spec.get("brand") if isinstance(spec.get("brand"), dict) else None
+        if brand and not brand.get("_loaded"):
+            brand = None
+        lang = str(spec.get("lang") or spec.get("language") or self.valves.language)
+        cover_req = spec.get("cover")
+        _tidy_blocks(spec, has_cover=not use_letterhead and (
+            cover_req == "auto" or isinstance(cover_req, dict)
+        ))
 
         # Image resolver bound to current valves
         unsplash_key = (self.valves.unsplash_access_key or "").strip()
@@ -5207,23 +6000,11 @@ class Tools:
             if isinstance(header_spec, dict):
                 header_logo = await _cover_image(header_spec, "logo", _resolver)
 
-            # Suppress the running header/footer on page 1 when a cover exists.
-            cover_present = bool(spec.get("cover"))
-
-            # Header / footer
-            _build_header_footer(
-                doc,
-                header_spec=header_spec,
-                footer_spec=footer_spec,
-                accent_hex=accent_hex,
-                header_logo=header_logo,
-                first_page_different=cover_present,
-            )
-
             # Cover page (template "auto" cover OR explicit cover dict). In both
             # cases we backfill missing fields from the top-level spec so authors
             # can put title/subtitle/author/date in the frontmatter root and only
             # use ``cover:`` for style/kicker overrides.
+            merged_cover = None
             cover_spec = spec.get("cover")
             if cover_spec == "auto":
                 cover_spec = {}
@@ -5233,9 +6014,10 @@ class Tools:
                             "kicker", "eyebrow", "organization", "org"):
                     if not merged_cover.get(key) and spec.get(key):
                         merged_cover[key] = spec.get(key)
-                # Default cover style from the styles block (template-provided).
+                # A brand draws its own cover unless a style is asked for;
+                # otherwise the template's default style.
                 if not merged_cover.get("style"):
-                    cstyle = (spec.get("styles") or {}).get("cover_style")
+                    cstyle = "brand" if brand else (spec.get("styles") or {}).get("cover_style")
                     if cstyle:
                         merged_cover["style"] = cstyle
                 has_content = any(
@@ -5243,11 +6025,40 @@ class Tools:
                     for k in ("title", "subtitle", "author", "date",
                               "kicker", "eyebrow", "logo", "logo_b64", "logo_hint")
                 )
-                if has_content:
-                    await _build_cover_page(
-                        doc, merged_cover, accent_hex=accent_hex,
-                        image_resolver=_resolver,
-                    )
+                if not has_content:
+                    merged_cover = None
+            brand_cover = bool(
+                brand and merged_cover and merged_cover.get("style") == "brand"
+            )
+
+            # Header / footer. A brand cover is a section of its own with no
+            # header, so page 1 of the body keeps the running header.
+            if brand and brand.get("own_header"):
+                header_spec = None
+            if brand and brand.get("own_footer"):
+                footer_spec = None
+            _build_header_footer(
+                doc,
+                header_spec=header_spec,
+                footer_spec=footer_spec,
+                accent_hex=accent_hex,
+                header_logo=header_logo,
+                first_page_different=bool(merged_cover) and not brand_cover,
+            )
+            if brand:
+                _build_brand_header_footer(
+                    doc, brand, title=_document_title(spec), lang=lang,
+                    header=bool(brand.get("own_header")),
+                    footer=bool(brand.get("own_footer")),
+                )
+
+            if brand_cover:
+                _build_brand_cover(doc, merged_cover, brand, lang=lang)
+            elif merged_cover:
+                await _build_cover_page(
+                    doc, merged_cover, accent_hex=accent_hex,
+                    image_resolver=_resolver,
+                )
 
         # Template-specific intro blocks (memo header, letter addresses)
         template_name = spec.get("template", "blank")
@@ -5274,6 +6085,10 @@ class Tools:
 
         if use_letterhead:
             _append_letterhead_tail(doc)
+        else:
+            _close_brand_cover(doc)
+        # the company's header/footer parts of a letterhead are left as found
+        _fix_ooxml_order(doc, headers_footers=not use_letterhead)
 
         return doc
 
@@ -5309,7 +6124,7 @@ class Tools:
         return _parse_markdown(text)
 
     # ── Save / files API ─────────────────────────────────────────────────────
-    def _save_docx(
+    async def _save_docx(
         self,
         docx_bytes: bytes,
         *,
@@ -5331,7 +6146,7 @@ class Tools:
         # --- Primary: OpenWebUI Files API (visible in UI Files panel) ---
         if _HAS_OWUI_FILES and request and user_dict:
             try:
-                user_model = Users.get_user_by_id(user_dict["id"])
+                user_model = await _maybe_await(Users.get_user_by_id(user_dict["id"]))
                 if user_model:
                     upload = UploadFile(
                         file=BytesIO(docx_bytes),
@@ -5342,13 +6157,13 @@ class Tools:
                                 "wordprocessingml.document"
                         }),
                     )
-                    file_item = upload_file_handler(
+                    file_item = await _maybe_await(upload_file_handler(
                         request=request,
                         file=upload,
                         metadata={},
                         process=False,
                         user=user_model,
-                    )
+                    ))
                     if file_item:
                         file_id = getattr(file_item, "id", None)
                         if file_id:
@@ -5493,6 +6308,35 @@ class Tools:
                     "(b64/url/unsplash), and `style`: `rule` (editorial, "
                     "default), `band` (title reversed on an accent panel), "
                     "`banner` (hero image on top), `centered`.\n\n"
+                    "BRAND (client identity): frontmatter `brand: <preset>` "
+                    "(a name installed by the admin; an unknown name returns "
+                    "the list) or a map {name, logo, logo_header, primary, "
+                    "secondary, prepared_by}. `logo`: the file name of an "
+                    "image the user attached in chat, a path in the user's "
+                    "terminal, a URL or a data URI; omit it to use the image "
+                    "attached in chat. "
+                    "It colours the document and, on a template with a cover "
+                    "(report/proposal/whitepaper), draws a full-page branded "
+                    "cover plus a header with the logo and a footer 'Pag. X "
+                    "di Y'. Put the cover fields in `cover:`: `kicker` (type "
+                    "of document) and `meta` (a map of label: value, e.g. "
+                    "Committente, CIG, Importo; the date is added). `lang: "
+                    "it|en` sets the labels. Always fill `cover.kicker` "
+                    "(the type of document), `subtitle` and the `meta` fields "
+                    "you know (client, project, reference, author, version). "
+                    "Sections are `#` headings (not one `#` wrapping `##`), "
+                    "and do not put `---` between sections: headings already "
+                    "draw their rule.\n"
+                    "   ---\n"
+                    "   template: report\n"
+                    "   title: Analisi del disciplinare\n"
+                    "   brand: ianustec\n"
+                    "   cover:\n"
+                    "     kicker: Analisi di gara\n"
+                    "     meta:\n"
+                    "       Committente: Comune di X\n"
+                    "       CIG: \"AB12345678\"\n"
+                    "   ---\n\n"
                     "HEADER/FOOTER: header supports `text`, `logo` and "
                     "`show_page_numbers`; footer supports either `text` + "
                     "`show_page_numbers`, or a 3-zone layout via `left`, "

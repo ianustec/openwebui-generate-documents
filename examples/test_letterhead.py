@@ -60,7 +60,7 @@ def test_chat_docx_files_filter():
             {"id": "d", "filename": "photo.png"},
         ]
     }
-    out = mod._chat_docx_files(meta, None)
+    out = asyncio.run(mod._chat_docx_files(meta, None))
     names = {x["name"] for x in out}
     assert names == {"Carta.docx", "Other.dotx"}
     print("OK chat file filter")
@@ -123,9 +123,12 @@ def test_resolve_falls_back_to_disk_when_api_unreadable():
         path = Path(tmp) / "carta intestata.docx"
         path.write_bytes(raw)
         orig = mod._read_owui_file_bytes
-        mod._read_owui_file_bytes = lambda _fid: None
+        async def _unreadable(_fid):
+            return None
+
+        mod._read_owui_file_bytes = _unreadable
         try:
-            doc = mod._resolve_letterhead_doc(
+            doc = asyncio.run(mod._resolve_letterhead_doc(
                 "carta intestata.docx",
                 metadata={"files": [
                     {"id": "947bc6b5-3a9d-4ca4-966d-d160727f9533",
@@ -133,7 +136,7 @@ def test_resolve_falls_back_to_disk_when_api_unreadable():
                 ]},
                 files=None,
                 letterhead_dirs=[tmp],
-            )
+            ))
         finally:
             mod._read_owui_file_bytes = orig
         assert doc.sections[0].header.paragraphs[0].text == "ACME Letterhead HEADER"

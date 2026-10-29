@@ -34,6 +34,9 @@ fallback) and a clickable **download link** appears in the chat.
 - **Human-readable filename** derived from the title (e.g. `Q3 Board Report.docx`).
 - **Optional images** from Unsplash (with a key) or generated via Open WebUI.
 - **Single-file**: one self-contained `.py`, ready to paste into the Tools registry.
+- **Client brand**: `brand: <preset>` (or an inline map with name, logos and two colours) gives a full-page branded cover with a grid of `cover.meta` fields, a running header with the logo and a "Page X of Y" footer.
+- **Tidy structure**: a `---` right before a heading is dropped (the heading already draws its rule); with a cover, a single `#` wrapping the whole document becomes the cover subtitle and the sections move up one level.
+- **Word-exact output**: table grids match the cells, column widths follow the content, and every property element is written in schema order (Word, unlike LibreOffice, ignores out-of-order cell margins).
 - **Company letterhead**: set `letterhead: "Filename.docx"` (`.dotx` accepted). Resolved from chat attachments first, then from `/mnt/uploads` (and the Open WebUI upload dir). Header, footer and margins are kept; only the body is rewritten.
 
 ## Requirements
@@ -117,6 +120,33 @@ Do not use a programmatic `cover` together with a letterhead (it would fight the
 
 See also [`examples/letterhead.md`](examples/letterhead.md).
 
+### Client brand
+
+Install a preset as `<brands_dir>/<name>.json` (default `/app/backend/data/brands`) with the logo files next to it:
+
+```json
+{ "name": "IANUSTEC S.r.l.", "logo": "ianustec_logo.png", "logo_header": "ianustec_wordmark.png",
+  "primary": "#000000", "secondary": "#333333", "prepared_by": "NEURA | IANUSTEC" }
+```
+
+Then in the frontmatter:
+
+```markdown
+---
+template: report
+title: "Tender analysis"
+brand: ianustec
+lang: en
+cover:
+  kicker: "Tender analysis"
+  meta:
+    Client: "City of X"
+    Tender ID: "AB12345678"
+---
+```
+
+`brand` also accepts the map itself. Its `logo` can be the name of an image attached in chat (pasted, uploaded, or saved to the user's Open Terminal when `chat_uploads` is `filesystem`), a path in the user's terminal, a URL or a data URI; without `logo` the image attached in chat is used. An unknown preset name returns the list of installed ones. A black or grey brand colour gets a light cover band instead of a solid dark one.
+
 ### JSON (legacy, still supported)
 
 ```json
@@ -171,6 +201,8 @@ Every template derives its full palette from a single `accent` color, so
 | `image_generation_api_key` | `""` | Bearer token for `image_generation_url` |
 | `docx_export_dir` | `/app/backend/data/cache/files` | Fallback directory for saving |
 | `emit_status` | `true` | Emit status events in chat |
+| `brands_dir` | `/app/backend/data/brands` | Brand presets for `brand: <name>` |
+| `language` | `it` | Labels written by the tool (cover date, page X of Y): `it` or `en`; frontmatter `lang` overrides |
 
 ## How it works
 
