@@ -26,3 +26,12 @@ doc = asyncio.run(tool._build_document(spec))
 out = BASE / "examples" / "demo_report.docx"
 doc.save(out)
 print(f"OK: {out} ({out.stat().st_size} bytes)")
+
+# Client brand: preset examples/brands/ianustec.json, logo next to it
+tool.valves.brands_dir = str(BASE / "examples" / "brands")
+raw = tool._parse_content((BASE / "examples" / "brand.md").read_text())
+spec = asyncio.run(tool._prepare_spec(raw))
+doc = asyncio.run(tool._build_document(spec))
+out = BASE / "examples" / "demo_brand.docx"
+doc.save(out)
+print(f"OK: {out} ({out.stat().st_size} bytes)")

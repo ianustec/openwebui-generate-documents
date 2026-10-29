@@ -16,7 +16,7 @@ fallback) and a clickable **download link** appears in the chat.
 
 ![Preview](assets/hero.png)
 
-*Document generated from the example [`examples/report.md`](examples/report.md) → [`examples/demo_report.docx`](examples/demo_report.docx).*
+*Left: client brand ([`examples/brand.md`](examples/brand.md) → [`examples/demo_brand.docx`](examples/demo_brand.docx)). Right: [`examples/report.md`](examples/report.md) → [`examples/demo_report.docx`](examples/demo_report.docx).*
 
 ## Features
 
@@ -190,6 +190,8 @@ Every template derives its full palette from a single `accent` color, so
 | ![Cover](assets/cover.png) | ![Content](assets/content.png) |
 | **Callouts & tables** | **Risk matrix & signatures** |
 | ![Callouts](assets/callouts.png) | ![Table](assets/table.png) |
+| **Client brand: cover** | **Client brand: header and footer** |
+| ![Brand cover](assets/brand-cover.png) | ![Brand content](assets/brand-content.png) |
 
 ## Valves (configuration)
 
@@ -218,7 +220,7 @@ Requires `python-docx`, `markdown-it-py`, `mdit-py-plugins`, `PyYAML` (and optio
 
 ```bash
 pip install python-docx pillow httpx markdown-it-py mdit-py-plugins PyYAML
-python examples/build.py   # → examples/demo_report.docx
+python examples/build.py   # → examples/demo_report.docx, examples/demo_brand.docx
 ```
 
 The file is designed to run inside Open WebUI: the `open_webui.*` imports are optional
