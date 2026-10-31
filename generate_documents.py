@@ -134,6 +134,15 @@ except ImportError:
 # When the path stored in the ``file`` table is something like
 # ``s3://bucket/key`` it won't exist on local disk; ``Storage.get_file()``
 # downloads the object to ``UPLOAD_DIR`` and returns a local path.
+# Open WebUI's own gate for file ids that arrive from the client (see
+# utils/files.get_image_base64_from_file_id): owner, admin, or a read grant.
+try:
+    from open_webui.utils.access_control.files import (  # type: ignore
+        has_access_to_file as _owui_has_access_to_file,
+    )
+except ImportError:
+    _owui_has_access_to_file = None  # type: ignore[assignment]
+
 try:
     from open_webui.storage.provider import Storage as _OwuiStorage  # type: ignore
     _HAS_OWUI_STORAGE = True
@@ -436,11 +445,51 @@ async def _maybe_await(value: Any) -> Any:
     return await value if inspect.isawaitable(value) else value
 
 
-async def _read_owui_file_bytes(file_id: str) -> Optional[bytes]:
-    """Read raw bytes for an OpenWebUI file, supporting any storage backend.
+def _user_id_role(user: Any) -> tuple[str, str]:
+    """(id, role) from the ``__user__`` dict or a UserModel; empty when absent."""
+    if isinstance(user, dict):
+        return str(user.get("id") or ""), str(user.get("role") or "")
+    return (
+        str(getattr(user, "id", "") or ""),
+        str(getattr(user, "role", "") or ""),
+    )
+
+
+async def _user_may_read_file(file_row: Any, user: Any) -> bool:
+    """Owner, admin, or an explicit read grant; otherwise no.
+
+    Every id this reader sees comes from client-controlled input (attachment
+    lists, chat metadata, ``/files/<id>`` URLs in messages), so it applies the
+    same rule Open WebUI applies to ``image_url`` file ids and fails closed
+    without a user.
+    """
+    uid, role = _user_id_role(user)
+    if not uid:
+        return False
+    if getattr(file_row, "user_id", None) == uid or role == "admin":
+        return True
+    if _owui_has_access_to_file is None:
+        return False
+    try:
+        from open_webui.models.users import UserModel  # type: ignore
+
+        user_model = UserModel(**user) if isinstance(user, dict) else user
+        return bool(
+            await _maybe_await(_owui_has_access_to_file(
+                getattr(file_row, "id", None), "read", user_model,
+            ))
+        )
+    except Exception as exc:
+        print(f"[documents] file: access check failed: {exc}", file=sys.stderr)
+        return False
+
+
+async def _read_owui_file_bytes(file_id: str, user: Any = None) -> Optional[bytes]:
+    """Read raw bytes for an OpenWebUI file the ``user`` may read.
 
     Tries the row ``path``, meta paths, ``UPLOAD_DIR`` / ``/mnt/uploads``
-    name variants, then ``Storage.get_file`` for remote URIs.
+    name variants, then ``Storage.get_file`` for remote URIs. Returns None
+    (and logs) when the user is missing or not allowed to read the file.
     """
     if not file_id or _OwuiFiles is None:
         return None
@@ -451,6 +500,9 @@ async def _read_owui_file_bytes(file_id: str) -> Optional[bytes]:
         return None
     if not file_row:
         print(f"[documents] file: no row for id {file_id}", file=sys.stderr)
+        return None
+    if not await _user_may_read_file(file_row, user):
+        print(f"[documents] file: access denied for id {file_id}", file=sys.stderr)
         return None
 
     remote_uris: list[str] = []
@@ -950,6 +1002,7 @@ async def _resolve_letterhead_doc(
     metadata: Any = None,
     files: Any = None,
     letterhead_dirs: Optional[list[str]] = None,
+    user: Any = None,
 ) -> _DocxDocument:
     """Load a letterhead, trying Files API then on-disk paths.
 
@@ -961,7 +1014,7 @@ async def _resolve_letterhead_doc(
     candidates = await _chat_docx_files(metadata, files)
     matched = _match_letterhead(letterhead_name, candidates)
     if matched:
-        data = await _read_owui_file_bytes(matched["id"])
+        data = await _read_owui_file_bytes(matched["id"], user=user)
         if data:
             return _load_letterhead_doc(raw=data)
         errors.append(
@@ -1141,7 +1194,7 @@ async def _generate_image_via_openwebui(
 
     file_id_match = re.search(r"/files/([0-9a-fA-F-]{8,})/", url)
     if file_id_match:
-        data = await _read_owui_file_bytes(file_id_match.group(1))
+        data = await _read_owui_file_bytes(file_id_match.group(1), user=user_dict)
         if data:
             return data
         print(
@@ -3899,7 +3952,7 @@ async def _brand_asset(src: Any, base_dir: str, ctx: Optional[dict] = None) -> O
     if match.get("data"):
         return _b64_decode_lenient(match["data"])
     if match.get("id"):
-        data = await _read_owui_file_bytes(match["id"])
+        data = await _read_owui_file_bytes(match["id"], user=ctx.get("user"))
         if data:
             return data
     if match.get("path"):
@@ -5913,6 +5966,7 @@ class Tools:
                     metadata=metadata,
                     files=files,
                     letterhead_dirs=letterhead_dirs,
+                    user=user_dict,
                 )
             lh_fonts = _detect_letterhead_fonts(doc)
             _clear_body(doc)

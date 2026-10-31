@@ -123,7 +123,7 @@ def test_resolve_falls_back_to_disk_when_api_unreadable():
         path = Path(tmp) / "carta intestata.docx"
         path.write_bytes(raw)
         orig = mod._read_owui_file_bytes
-        async def _unreadable(_fid):
+        async def _unreadable(_fid, user=None):
             return None
 
         mod._read_owui_file_bytes = _unreadable
@@ -143,6 +143,40 @@ def test_resolve_falls_back_to_disk_when_api_unreadable():
     print("OK Files API miss falls back to disk")
 
 
+async def test_read_owui_file_bytes_is_owner_checked():
+    """Ids reach the reader from client input (attachments, chat metadata,
+    /files/<id> URLs in messages). Owner and admin read; anyone else, or no
+    user at all, gets None. Mirrors Open WebUI's rule for image_url file ids."""
+    raw = _make_letterhead_bytes()
+    with tempfile.TemporaryDirectory() as tmp:
+        path = Path(tmp) / "owned.docx"
+        path.write_bytes(raw)
+
+        class _Row:
+            id = "fid"
+            user_id = "owner-1"
+            filename = "owned.docx"
+            meta = {}
+
+        _Row.path = str(path)
+
+        class _Files:
+            @staticmethod
+            async def get_file_by_id(_fid):
+                return _Row()
+
+        orig = mod._OwuiFiles
+        mod._OwuiFiles = _Files
+        try:
+            assert await mod._read_owui_file_bytes("fid") is None
+            assert await mod._read_owui_file_bytes("fid", user={"id": "other", "role": "user"}) is None
+            assert await mod._read_owui_file_bytes("fid", user={"id": "owner-1", "role": "user"}) == raw
+            assert await mod._read_owui_file_bytes("fid", user={"id": "x", "role": "admin"}) == raw
+        finally:
+            mod._OwuiFiles = orig
+    print("OK file reads are owner-checked")
+
+
 def test_coalesce_aliases():
     s = mod._resolve_template({"template": "blank", "sample": "X.docx"})
     assert s.get("letterhead") == "X.docx"
@@ -156,6 +190,7 @@ def main():
     test_chat_docx_files_filter()
     test_clear_body_preserves_header()
     test_resolve_falls_back_to_disk_when_api_unreadable()
+    asyncio.run(test_read_owui_file_bytes_is_owner_checked())
     test_coalesce_aliases()
     asyncio.run(test_build_with_letterhead_bytes())
     asyncio.run(test_build_without_letterhead_regression())
