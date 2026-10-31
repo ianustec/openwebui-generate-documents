@@ -207,6 +207,62 @@ async def test_foreign_attachment_never_falls_back_to_disk():
     print("OK foreign attachment never falls back to disk")
 
 
+async def test_row_bytes_come_only_from_server_set_locations():
+    """The owner gate checks the row; the bytes must then come only from
+    row.path or the row's own <id>_<filename> under the upload dir. The
+    client's upload metadata (meta.data.path) and a client-chosen filename
+    must not steer the read, and remote storage is asked only for row.path."""
+    raw = _make_letterhead_bytes()
+    with tempfile.TemporaryDirectory() as tmp:
+        victim = Path(tmp) / "victim-uuid_secret.docx"
+        victim.write_bytes(raw)
+        own = Path(tmp) / "own.docx"
+        own.write_bytes(b"PK-own")
+
+        class _Row:
+            id = "attacker-row"
+            user_id = "me"
+            filename = "victim-uuid_secret.docx"
+            meta = {"data": {"path": str(victim)}, "path": str(victim)}
+
+        _Row.path = str(own)
+
+        class _Files:
+            @staticmethod
+            async def get_file_by_id(_fid):
+                return _Row()
+
+        calls = []
+
+        class _Storage:
+            @staticmethod
+            def get_file(uri):
+                calls.append(uri)
+                raise FileNotFoundError(uri)
+
+        orig = (mod._OwuiFiles, mod._OwuiStorage, mod._HAS_OWUI_STORAGE, os.environ.get("UPLOAD_DIR"))
+        mod._OwuiFiles, mod._OwuiStorage, mod._HAS_OWUI_STORAGE = _Files, _Storage, True
+        os.environ["UPLOAD_DIR"] = tmp
+        try:
+            cands = mod._file_row_local_paths(_Row())
+            assert str(victim) not in cands, cands
+            assert await mod._read_owui_file_bytes("attacker-row", user={"id": "me", "role": "user"}) == b"PK-own"
+            # remote row: only row.path reaches Storage, never the meta path
+            _Row.path = "s3://bucket/own.docx"
+            _Row.filename = "x.docx"
+            assert await mod._read_owui_file_bytes("attacker-row", user={"id": "me", "role": "user"}) is None
+            assert calls == ["s3://bucket/own.docx"], calls
+            # a letterhead dir that is the upload dir is refused
+            assert mod._safe_letterhead_dirs([tmp]) == []
+        finally:
+            mod._OwuiFiles, mod._OwuiStorage, mod._HAS_OWUI_STORAGE = orig[:3]
+            if orig[3] is None:
+                os.environ.pop("UPLOAD_DIR", None)
+            else:
+                os.environ["UPLOAD_DIR"] = orig[3]
+    print("OK row bytes come only from server-set locations")
+
+
 async def test_read_owui_file_bytes_is_owner_checked():
     """Ids reach the reader from client input (attachments, chat metadata,
     /files/<id> URLs in messages). Owner and admin read; anyone else, or no
@@ -261,6 +317,7 @@ def main():
     test_resolve_falls_back_to_disk_when_api_unreadable()
     asyncio.run(test_read_owui_file_bytes_is_owner_checked())
     asyncio.run(test_foreign_attachment_never_falls_back_to_disk())
+    asyncio.run(test_row_bytes_come_only_from_server_set_locations())
     test_coalesce_aliases()
     asyncio.run(test_build_with_letterhead_bytes())
     asyncio.run(test_build_without_letterhead_regression())
