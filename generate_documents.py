@@ -415,7 +415,7 @@ def _file_row_local_paths(file_row: Any) -> list[str]:
         names.append(f"{fid}_{os.path.basename(str(filename))}")
     if fid:
         names.append(str(fid))
-    for d in _default_letterhead_dirs():
+    for d in _default_letterhead_dirs() + _owui_upload_dirs():
         for n in names:
             out.append(os.path.join(d, n))
     seen: set[str] = set()
@@ -443,6 +443,11 @@ async def _maybe_await(value: Any) -> Any:
     """OpenWebUI 0.12 made the model/router helpers async; older releases
     are sync. Accept both."""
     return await value if inspect.isawaitable(value) else value
+
+
+class _FileAccessDenied(PermissionError):
+    """The caller may not read this Open WebUI file. Distinct from "unreadable"
+    so no caller mistakes a denial for a storage miss and tries another route."""
 
 
 def _user_id_role(user: Any) -> tuple[str, str]:
@@ -474,6 +479,9 @@ async def _user_may_read_file(file_row: Any, user: Any) -> bool:
         from open_webui.models.users import UserModel  # type: ignore
 
         user_model = UserModel(**user) if isinstance(user, dict) else user
+    except Exception:
+        user_model = user  # outside Open WebUI (tests): the fake takes the dict
+    try:
         return bool(
             await _maybe_await(_owui_has_access_to_file(
                 getattr(file_row, "id", None), "read", user_model,
@@ -488,8 +496,9 @@ async def _read_owui_file_bytes(file_id: str, user: Any = None) -> Optional[byte
     """Read raw bytes for an OpenWebUI file the ``user`` may read.
 
     Tries the row ``path``, meta paths, ``UPLOAD_DIR`` / ``/mnt/uploads``
-    name variants, then ``Storage.get_file`` for remote URIs. Returns None
-    (and logs) when the user is missing or not allowed to read the file.
+    name variants, then ``Storage.get_file`` for remote URIs. Raises
+    :class:`_FileAccessDenied` when the user is missing or may not read the
+    file; returns None only for a genuine storage miss.
     """
     if not file_id or _OwuiFiles is None:
         return None
@@ -503,7 +512,7 @@ async def _read_owui_file_bytes(file_id: str, user: Any = None) -> Optional[byte
         return None
     if not await _user_may_read_file(file_row, user):
         print(f"[documents] file: access denied for id {file_id}", file=sys.stderr)
-        return None
+        raise _FileAccessDenied(file_id)
 
     remote_uris: list[str] = []
     for path in _file_row_local_paths(file_row):
@@ -579,15 +588,19 @@ def _file_entry_id_name(entry: Any) -> tuple[str, str]:
     return fid, name
 
 
-async def _enrich_filename_from_owui(file_id: str) -> str:
-    """Best-effort filename lookup via OpenWebUI Files model."""
-    if not file_id or not _HAS_OWUI_IMAGES or _OwuiFiles is None:
+async def _enrich_filename_from_owui(file_id: str, user: Any = None) -> str:
+    """Filename of an Open WebUI file the ``user`` may read; "" otherwise.
+
+    Gated like the byte reader: a bare id in the attachment list must not
+    reveal another user's filename (which the disk matcher would then use).
+    """
+    if not file_id or _OwuiFiles is None:
         return ""
     try:
         row = await _maybe_await(_OwuiFiles.get_file_by_id(file_id))
     except Exception:
         return ""
-    if not row:
+    if not row or not await _user_may_read_file(row, user):
         return ""
     name = getattr(row, "filename", None) or getattr(row, "name", None) or ""
     if not name:
@@ -600,6 +613,7 @@ async def _enrich_filename_from_owui(file_id: str) -> str:
 async def _chat_docx_files(
     metadata: Any = None,
     files: Any = None,
+    user: Any = None,
 ) -> list[dict[str, str]]:
     """List .docx/.dotx attachments from chat ``__files__`` / ``__metadata__``.
 
@@ -626,7 +640,7 @@ async def _chat_docx_files(
         if not fid or fid in seen:
             continue
         if not name:
-            name = await _enrich_filename_from_owui(fid)
+            name = await _enrich_filename_from_owui(fid, user)
         if not name or not _is_docx_name(name):
             continue
         seen.add(fid)
@@ -672,13 +686,23 @@ def _match_letterhead(
 
 
 def _default_letterhead_dirs() -> list[str]:
-    """Directories scanned for on-disk letterhead files.
+    """Directories scanned by filename for on-disk letterhead files.
 
-    Covers the code-interpreter mount (``/mnt/uploads``) and OpenWebUI's
-    server-side upload dir. ``UPLOAD_DIR`` env / package constant is included
-    when resolvable so the tool follows non-default deployments.
+    Only the code-interpreter / terminal mount (``/mnt/uploads``). A directory
+    matched by filename is readable by every user of the tool, so Open WebUI's
+    ``UPLOAD_DIR`` (every user's uploads) must never be in this list; earlier
+    versions scanned it and any user could obtain any other user's .docx by
+    name. Admins add shared letterhead directories with ``letterhead_dirs``.
     """
-    dirs: list[str] = ["/mnt/uploads"]
+    return ["/mnt/uploads"]
+
+
+def _owui_upload_dirs() -> list[str]:
+    """Open WebUI's upload directories, for locating a row's bytes on disk.
+
+    Only used after the row passed the access check; never scanned by name.
+    """
+    dirs: list[str] = []
     env_dir = os.environ.get("UPLOAD_DIR")
     if env_dir:
         dirs.append(env_dir)
@@ -690,13 +714,7 @@ def _default_letterhead_dirs() -> list[str]:
     except Exception:
         pass
     dirs.append("/app/backend/data/uploads")
-    seen: set[str] = set()
-    out: list[str] = []
-    for d in dirs:
-        if d and d not in seen:
-            seen.add(d)
-            out.append(d)
-    return out
+    return list(dict.fromkeys(d for d in dirs if d))
 
 
 def _list_disk_docx(dirs: list[str]) -> list[dict[str, str]]:
@@ -763,14 +781,11 @@ def _letterhead_missing_error(
         f'Letterhead file "{wanted}" not found. '
         f"Attached .docx/.dotx: {attached}."
     )
-    if dirs is not None:
-        on_disk = ", ".join(
-            c.get("name") or "" for c in (disk_candidates or [])
-        ) or "(none)"
-        msg += (
-            f" Searched dirs {', '.join(dirs)} — found: {on_disk}."
-            " Upload the .docx/.dotx to one of those dirs, or attach it in chat."
-        )
+    # Never list what is on disk: shared directories may hold other teams'
+    # letterheads, and the text reaches the model and the user.
+    if dirs:
+        msg += f" Also searched {', '.join(dirs)} by filename, no match."
+    msg += " Attach the .docx/.dotx in chat, or place it in one of those directories."
     return msg
 
 
@@ -1011,10 +1026,18 @@ async def _resolve_letterhead_doc(
     """
     errors: list[str] = []
     dirs = letterhead_dirs or _default_letterhead_dirs()
-    candidates = await _chat_docx_files(metadata, files)
+    candidates = await _chat_docx_files(metadata, files, user)
     matched = _match_letterhead(letterhead_name, candidates)
     if matched:
-        data = await _read_owui_file_bytes(matched["id"], user=user)
+        try:
+            data = await _read_owui_file_bytes(matched["id"], user=user)
+        except _FileAccessDenied:
+            # A denial ends the lookup: falling through to a filename match on
+            # disk is how another user's upload could be read.
+            raise ValueError(
+                f'Letterhead "{letterhead_name}": you do not have access to '
+                "that file. Attach your own copy in chat."
+            ) from None
         if data:
             return _load_letterhead_doc(raw=data)
         errors.append(
@@ -1194,7 +1217,10 @@ async def _generate_image_via_openwebui(
 
     file_id_match = re.search(r"/files/([0-9a-fA-F-]{8,})/", url)
     if file_id_match:
-        data = await _read_owui_file_bytes(file_id_match.group(1), user=user_dict)
+        try:
+            data = await _read_owui_file_bytes(file_id_match.group(1), user=user_dict)
+        except _FileAccessDenied:
+            data = None
         if data:
             return data
         print(
@@ -3952,7 +3978,10 @@ async def _brand_asset(src: Any, base_dir: str, ctx: Optional[dict] = None) -> O
     if match.get("data"):
         return _b64_decode_lenient(match["data"])
     if match.get("id"):
-        data = await _read_owui_file_bytes(match["id"], user=ctx.get("user"))
+        try:
+            data = await _read_owui_file_bytes(match["id"], user=ctx.get("user"))
+        except _FileAccessDenied:
+            return None
         if data:
             return data
     if match.get("path"):
@@ -5712,10 +5741,11 @@ class Tools:
         letterhead_dirs: str = Field(
             default="",
             description=(
-                "OPTIONAL comma-separated directories scanned for a `letterhead`"
-                " .docx/.dotx file when it is NOT attached in chat. Leave empty"
-                " to use sensible defaults (/mnt/uploads, OpenWebUI UPLOAD_DIR,"
-                " /app/backend/data/uploads)."
+                "OPTIONAL comma-separated directories scanned by filename for a"
+                " `letterhead` .docx/.dotx that is not attached in chat. Every"
+                " user of the tool can read what is in them, so list only shared"
+                " letterheads. Empty (default) = /mnt/uploads only; Open WebUI's"
+                " upload dir is never scanned."
             ),
         )
         brands_dir: str = Field(

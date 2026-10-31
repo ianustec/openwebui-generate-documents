@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+import os
 import importlib.util
 import sys
 import tempfile
@@ -143,6 +144,69 @@ def test_resolve_falls_back_to_disk_when_api_unreadable():
     print("OK Files API miss falls back to disk")
 
 
+async def test_foreign_attachment_never_falls_back_to_disk():
+    """A denied Files-API read must end the lookup. Before, it was treated like
+    a storage miss and the filename was matched against the upload dir, which
+    holds every user's files."""
+    raw = _make_letterhead_bytes()
+    vid = "11111111-2222-4333-8444-555555555555"
+    with tempfile.TemporaryDirectory() as tmp:
+        (Path(tmp) / f"{vid}_carta intestata.docx").write_bytes(raw)
+
+        class _Row:
+            id = vid
+            user_id = "victim"
+            filename = "carta intestata.docx"
+            meta = {}
+
+        _Row.path = str(Path(tmp) / f"{vid}_carta intestata.docx")
+
+        class _Files:
+            @staticmethod
+            async def get_file_by_id(_fid):
+                return _Row()
+
+        orig_files, orig_env = mod._OwuiFiles, os.environ.get("UPLOAD_DIR")
+        mod._OwuiFiles = _Files
+        os.environ["UPLOAD_DIR"] = tmp
+        try:
+            assert tmp not in mod._default_letterhead_dirs()
+            attacker = {"id": "attacker", "role": "user"}
+            meta = {"files": [{"id": vid, "filename": "carta intestata.docx"}]}
+            for dirs in (None, [tmp]):
+                try:
+                    await mod._resolve_letterhead_doc(
+                        "carta intestata", metadata=meta, files=None,
+                        letterhead_dirs=dirs, user=attacker,
+                    )
+                except ValueError as exc:
+                    assert "access" in str(exc).lower() and vid not in str(exc)
+                else:
+                    raise AssertionError("foreign letterhead was returned")
+            # a bare id reveals no filename to a stranger
+            assert await mod._chat_docx_files({"files": [{"id": vid}]}, None, attacker) == []
+            # the error for a bogus name lists nothing
+            try:
+                await mod._resolve_letterhead_doc(
+                    "nope.docx", metadata={}, files=None, letterhead_dirs=[tmp], user=attacker,
+                )
+            except ValueError as exc:
+                assert vid not in str(exc) and "carta" not in str(exc)
+            # the owner still reads their own attachment
+            doc = await mod._resolve_letterhead_doc(
+                "carta intestata.docx", metadata=meta, files=None,
+                letterhead_dirs=None, user={"id": "victim", "role": "user"},
+            )
+            assert doc.sections[0].header.paragraphs[0].text == "ACME Letterhead HEADER"
+        finally:
+            mod._OwuiFiles = orig_files
+            if orig_env is None:
+                os.environ.pop("UPLOAD_DIR", None)
+            else:
+                os.environ["UPLOAD_DIR"] = orig_env
+    print("OK foreign attachment never falls back to disk")
+
+
 async def test_read_owui_file_bytes_is_owner_checked():
     """Ids reach the reader from client input (attachments, chat metadata,
     /files/<id> URLs in messages). Owner and admin read; anyone else, or no
@@ -168,8 +232,13 @@ async def test_read_owui_file_bytes_is_owner_checked():
         orig = mod._OwuiFiles
         mod._OwuiFiles = _Files
         try:
-            assert await mod._read_owui_file_bytes("fid") is None
-            assert await mod._read_owui_file_bytes("fid", user={"id": "other", "role": "user"}) is None
+            for user in (None, {"id": "other", "role": "user"}):
+                try:
+                    await mod._read_owui_file_bytes("fid", user=user)
+                except mod._FileAccessDenied:
+                    pass
+                else:
+                    raise AssertionError("denied read did not raise")
             assert await mod._read_owui_file_bytes("fid", user={"id": "owner-1", "role": "user"}) == raw
             assert await mod._read_owui_file_bytes("fid", user={"id": "x", "role": "admin"}) == raw
         finally:
@@ -191,6 +260,7 @@ def main():
     test_clear_body_preserves_header()
     test_resolve_falls_back_to_disk_when_api_unreadable()
     asyncio.run(test_read_owui_file_bytes_is_owner_checked())
+    asyncio.run(test_foreign_attachment_never_falls_back_to_disk())
     test_coalesce_aliases()
     asyncio.run(test_build_with_letterhead_bytes())
     asyncio.run(test_build_without_letterhead_regression())
