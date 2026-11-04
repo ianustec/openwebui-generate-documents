@@ -2739,6 +2739,16 @@ def _mint_list_num(doc: _DocxDocument, kind: str) -> int:
     ref = OxmlElement("w:abstractNumId")
     ref.set(qn("w:val"), str(abs_id))
     n.append(ref)
+    # a new numId alone does not restart the count: Word and LibreOffice keep
+    # counting across nums of the same abstract unless each level overrides
+    # its start
+    for level in range(4):
+        override = OxmlElement("w:lvlOverride")
+        override.set(qn("w:ilvl"), str(level))
+        start = OxmlElement("w:startOverride")
+        start.set(qn("w:val"), "1")
+        override.append(start)
+        n.append(override)
     numbering.append(n)
     return new_num
 
