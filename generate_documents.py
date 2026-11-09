@@ -199,6 +199,12 @@ DEFAULT_MARGIN_MM = 25.0  # 25 mm = ~1 inch, comfortable B2B default
 
 # region ── Image pipeline (mirrors openwebui_artifacts patterns) ─────────────
 
+# Largest image the tool downloads from a URL or reads from the user's
+# terminal. Anything bigger is skipped (the document is built without it)
+# instead of being buffered whole in the Open WebUI process.
+_MAX_IMAGE_BYTES = 10 * 1024 * 1024
+
+
 async def _fetch_unsplash_image(
     query: str,
     access_key: str,
@@ -343,12 +349,23 @@ async def _fetch_image_url(url: str, *, timeout: int = 15) -> Optional[bytes]:
         return None
     try:
         async with httpx.AsyncClient(timeout=timeout, follow_redirects=True) as client:
-            r = await client.get(url)
-            r.raise_for_status()
-            ctype = (r.headers.get("content-type") or "").lower()
-            if not ctype.startswith("image/"):
-                return None
-            return r.content
+            async with client.stream("GET", url) as r:
+                r.raise_for_status()
+                ctype = (r.headers.get("content-type") or "").lower()
+                if not ctype.startswith("image/"):
+                    return None
+                if int(r.headers.get("content-length") or 0) > _MAX_IMAGE_BYTES:
+                    print(f"[documents] image: {url} skipped (larger than "
+                          f"{_MAX_IMAGE_BYTES} bytes)", file=sys.stderr)
+                    return None
+                buf = bytearray()
+                async for chunk in r.aiter_bytes():
+                    buf += chunk
+                    if len(buf) > _MAX_IMAGE_BYTES:
+                        print(f"[documents] image: {url} skipped (larger than "
+                              f"{_MAX_IMAGE_BYTES} bytes)", file=sys.stderr)
+                        return None
+                return bytes(buf)
     except Exception:
         return None
 
@@ -3820,7 +3837,19 @@ async def _read_terminal_file(
                 url, headers=headers, cookies=cookies, allow_redirects=False,
             ) as resp:
                 if resp.status == 200 and resp.content_type.startswith("image/"):
-                    return await resp.read()
+                    buf = bytearray()
+                    too_large = (resp.content_length or 0) > _MAX_IMAGE_BYTES
+                    if not too_large:
+                        async for chunk in resp.content.iter_chunked(64 * 1024):
+                            buf += chunk
+                            if len(buf) > _MAX_IMAGE_BYTES:
+                                too_large = True
+                                break
+                    if too_large:
+                        print(f"[documents] brand: terminal read {path} skipped "
+                              f"(larger than {_MAX_IMAGE_BYTES} bytes)", file=sys.stderr)
+                        return None
+                    return bytes(buf)
                 print(f"[documents] brand: terminal read {path} -> HTTP {resp.status} "
                       f"{resp.content_type}", file=sys.stderr)
     except Exception as exc:
