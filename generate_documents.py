@@ -50,6 +50,7 @@ license: MIT
 
 from __future__ import annotations
 
+import asyncio
 import base64
 import inspect
 import json
@@ -476,7 +477,13 @@ async def _read_owui_file_bytes(file_id: str) -> Optional[bytes]:
     for uri in remote_uris:
         cached_path: Optional[str] = None
         try:
-            cached_path = await _maybe_await(_OwuiStorage.get_file(uri))
+            # Storage.get_file is sync and downloads the object (S3, GCS,
+            # Azure) before it returns; run it in a worker thread so the
+            # download does not block the event loop, as Open WebUI's own
+            # file helpers do. _maybe_await keeps an async provider working.
+            cached_path = await _maybe_await(
+                await asyncio.to_thread(_OwuiStorage.get_file, uri)
+            )
             data = _read_bytes_from_path(cached_path or "")
             if data:
                 return data
