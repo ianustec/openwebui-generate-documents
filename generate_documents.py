@@ -5586,6 +5586,16 @@ def _document_title(spec: dict) -> str:
     )
 
 
+def _is_legacy_function_calling(metadata: Any) -> bool:
+    """True only on Legacy function calling.
+
+    Native is Open WebUI's default and an unset model runs Native without
+    saying so, so test for "legacy" rather than for "native".
+    """
+    params = metadata.get("params") if isinstance(metadata, dict) else None
+    return isinstance(params, dict) and params.get("function_calling") == "legacy"
+
+
 def _tool_success_reply(fname: str, download_url: str, *, note: str = "") -> str:
     """Build the tool return string after a successful save.
 
@@ -5854,10 +5864,18 @@ class Tools:
                 f"Document was built but saving failed ({save_err})."
             )
 
+        # Attach the .docx to the assistant message as a file card. Open WebUI
+        # persists a `files` event with the message and renders it in both
+        # function-calling modes, so the user gets the file even if the model
+        # rephrases or drops the link.
+        await self._emit_file(__event_emitter__, fname, download_url, size=len(docx_bytes))
         # Emit the link ALSO as a live message event so the user sees a
         # clickable link the moment the file is saved (before the model
-        # finishes streaming its final reply). This is a "preview" channel.
-        await self._emit_link(__event_emitter__, fname, download_url)
+        # finishes streaming its final reply). Only on Legacy function
+        # calling: in Native mode (the default) the streamed completion
+        # snapshots replace the message content, so the event is lost.
+        if _is_legacy_function_calling(__metadata__):
+            await self._emit_link(__event_emitter__, fname, download_url)
         await self._emit_status(__event_emitter__, "Document ready.", done=True)
 
         # Authoritative copy of the link is ONLY in this return string (the
@@ -6215,6 +6233,35 @@ class Tools:
                 "type": "status",
                 "data": {"description": description, "done": done},
             })
+        except Exception:
+            pass
+
+    @staticmethod
+    async def _emit_file(emitter, fname: str, url: str, *, size: int = 0) -> None:
+        """Attach the saved document to the assistant message as a file card.
+
+        Open WebUI merges the ``files`` event into the message's ``files``,
+        stores it with the chat and renders each entry as a downloadable
+        card. The card opens the file by its id, so it is sent only for
+        Files API saves; the ``/cache/files`` fallback has no file row and
+        keeps just the link.
+        """
+        m = re.search(r"/api/v1/files/([0-9a-fA-F-]{8,})/content", url or "")
+        if not emitter or not m:
+            return
+        item: dict[str, Any] = {
+            "type": "file",
+            "id": m.group(1),
+            "name": fname,
+            "url": url,
+            "size": int(size or 0),
+            "content_type": (
+                "application/vnd.openxmlformats-officedocument."
+                "wordprocessingml.document"
+            ),
+        }
+        try:
+            await emitter({"type": "files", "data": {"files": [item]}})
         except Exception:
             pass
 
