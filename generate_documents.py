@@ -5695,11 +5695,9 @@ class Tools:
     def __init__(self):
         self.valves = self.Valves()
         self.citation = False
-        # Tool descriptors for native function calling (OpenWebUI reads these
-        # via getattr(tool_module, '__tools__', None) or by introspection
-        # depending on version; the legacy "self.tools = [...]" pattern from
-        # openwebui_artifacts.py still works in 0.4+).
-        self.tools = [self._tool_descriptor()]
+        # Open WebUI builds the function-calling spec from the public method's
+        # signature and reST docstring (`:param content:`); nothing else to
+        # register.
 
     # ── Public tool entry point ──────────────────────────────────────────────
     async def generate_document(
@@ -5712,78 +5710,64 @@ class Tools:
         __files__=None,
         __messages__=None,
     ) -> str:
-        """Generate a Word (.docx) document from a structured spec.
+        r"""Generate a native Word (.docx) document: report, letter, memo, proposal,
+        minutes, whitepaper, or anything on a company letterhead (carta intestata)
+        or client brand. Call THIS tool first for every Word/.docx request, also
+        when a letterhead/template .docx/.dotx is attached in chat or sits in
+        /mnt/uploads: pass its filename as `letterhead` and the tool finds and
+        reads it. NEVER use execute_code, python-docx, zipfile or a /mnt/uploads
+        listing to read or build a Word file: those fail (no lxml in Pyodide).
+        Use real content, never placeholders. After the call, reply with ONLY the
+        block the tool result tells you to copy.
 
-        WHEN TO CALL (do this first, do not explore other tools):
-        user asks for a Word/.docx/letter/report OR names a letterhead /
-        carta intestata / sample .docx/.dotx, including files in chat or
-        ``/mnt/uploads``. Set frontmatter ``letterhead: "exact-filename.docx"``
-        and write the body in Markdown. The tool finds the file itself.
-
-        NEVER use execute_code, python-docx, zipfile, or /mnt/uploads listing
-        to read or build a Word file. Those paths fail (no lxml in Pyodide).
-
-        The ``content`` parameter accepts TWO formats (auto-detected):
-
-        1. **Markdown-with-frontmatter** (preferred, more compact, more
-           robust on long documents). YAML frontmatter for
-           template/cover/header/footer/styles, body in standard Markdown
-           plus Pandoc fenced divs for callout/signature/page-break/toc.
-           Inline ``==text==`` maps to accent-colored runs.
-
-           Example:
-
-               ---
-               template: letter
-               letterhead: "carta intestata.docx"
-               title: Lettera commerciale
-               ---
-
-               # Oggetto
-               Body...
-
-               ---
-               template: report
-               title: FY 2024 Report
-               cover: auto
-               ---
-
-               # Executive summary
-               Revenue grew **24%** ...
-
-               ::: callout type="success" title="Note"
-               Body...
-               :::
-
-           Company letterhead: set ``letterhead: "Filename.docx"`` (also
-           accepts .dotx; aliases ``sample``, ``base_docx``). The file is
-           resolved from the chat attachments first, then from the upload
-           directories (``/mnt/uploads`` and the OpenWebUI upload dir). So a
-           letterhead uploaded to the chat OR placed in /mnt/uploads works —
-           just pass its filename. Header/footer/margins of that file are
-           kept; only the body is rewritten. Do NOT read the letterhead with
-           execute_code/python-docx; call this tool with ``letterhead`` set.
-           Do not use a programmatic cover with a letterhead.
-
-           Client brand: ``brand: <preset>`` (``brands_dir`` valve) or an
-           inline map {name, logo, logo_header, primary, secondary,
-           prepared_by}; ``cover.kicker`` and ``cover.meta`` fill the branded
-           cover, ``lang: it|en`` the labels.
-
-        2. **JSON** (legacy, fully supported): an object with the
-           ``title/template/page/styles/header/footer/cover/blocks`` shape
-           described in the tool descriptor.
-
-        Args:
-            content: Either Markdown-with-frontmatter or a JSON string.
-                Code fences (```` ```json ````, ```` ```markdown ````,
-                ```` ```md ````, ```` ```yaml ````) are stripped.
-
-        Returns:
-            A self-contained ``[TOOL_RESULT]`` string: it includes
-            ``OUTPUT_FOR_USER`` instructions plus the exact lines to copy
-            (markdown link inside ``---`` delimiters). A separate ``message``
-            event may also emit the link for live preview.
+        :param content: The whole document, as Markdown with YAML frontmatter
+            (preferred, auto-detected, robust on long documents) or as a JSON
+            object string with title/template/page/styles/header/footer/cover/blocks.
+            Code fences around it are stripped.
+            FRONTMATTER keys: template (report = numbered headings, cover and
+            "N / M" footer; whitepaper; proposal = accent band cover; letter; memo;
+            minutes; blank), title, subtitle, author, date, cover (auto, or a map:
+            style rule|band|banner|centered, kicker, organization, logo), header
+            (text, logo, show_page_numbers; hidden on page 1 when there is a
+            cover), footer (text + show_page_numbers, or left/center/right zones
+            using {page}), styles (accent "#RRGGBB", font, size_pt,
+            numbered_headings, cover_style), page (size a4|letter, orientation,
+            margin_mm), letter_fields (sender, recipient, date, subject, closing),
+            memo_fields (to, from, date, subject), lang (it|en).
+            LETTERHEAD: letterhead: "Exact-Filename.docx" (.dotx too; aliases
+            sample, base_docx), a file attached in chat or placed in /mnt/uploads.
+            Its header, footer and margins are kept and only the body is
+            rewritten. Do not set cover with a letterhead.
+            CLIENT BRAND: brand: <preset name> (brands_dir valve) or an inline map
+            {name, logo, logo_header, primary, secondary, prepared_by}; draws a
+            full-page client cover plus a logo header and a "Page X of Y" footer.
+            The logo can be an image attached in chat (by filename, or omitted
+            when one image is attached), a path in the user's terminal, a URL or a
+            data URI. Fill the cover with cover.kicker (the type of document) and
+            cover.meta (label: value pairs such as client, project, reference).
+            BODY (Markdown): # to #### headings; **bold**, *italic*, ==accent==,
+            `code`, [link](url); - and 1. lists (compact; nest with 2 spaces);
+            - [ ] / - [x] checklists; GFM tables (numeric columns right-align;
+            keep to 6 columns or fewer); fenced code; > quote; > [!note] Title
+            admonitions; [[toc]] right after a cover; \newpage for a page break;
+            --- for a rule; images ![alt](https://...),
+            ![alt](unsplash:english scene query),
+            ![alt](gen:english prompt of 10-30 words).
+            FENCED DIVS: callout (::: callout type="info|success|warning|danger"
+            title="..."), signature (name, role and date on separate lines), kpi
+            (YAML items: [{value, label}]), columns (YAML columns: [{heading,
+            text}]), definition (YAML items: [{term, description}]), figure (YAML
+            src and caption), letter, memo, toc, page-break. Open each with
+            "::: name" and close it with ":::".
+            JSON blocks (only for highly structured specs): heading {level, text,
+            eyebrow}, paragraph {text, variant: lead}, list {list_style:
+            bullet|decimal|legal|checklist, spacing, items}, table {headers, rows,
+            table_style: lines|grid|minimal, total_row, caption,
+            column_widths_pct}, kpi, columns, definition, code {language, code},
+            figure {image_hint|image_url, caption}, callout {kind, title, text},
+            page_break, toc, signature.
+        :return: A [TOOL_RESULT] string with the download link and the exact lines
+            to copy, or an error message.
         """
         try:
             spec_raw = self._parse_content(content)
@@ -6238,252 +6222,6 @@ class Tools:
             })
         except Exception:
             pass
-
-    # ── Tool descriptor (OpenWebUI native function calling) ──────────────────
-    @staticmethod
-    def _tool_descriptor() -> dict:
-        return {
-            "type": "function",
-            "function": {
-                "name": "generate_document",
-                "description": (
-                    "FIRST CHOICE for any Word/.docx/letter/report. "
-                    "If the user mentions letterhead, carta intestata, a "
-                    ".docx/.dotx attachment, or /mnt/uploads, call THIS tool "
-                    "immediately with frontmatter letterhead: \"Filename.docx\". "
-                    "Do NOT call execute_code, python-docx, zipfile, or listdir "
-                    "on /mnt/uploads. This tool resolves the file from chat "
-                    "attachments and /mnt/uploads by filename.\n\n"
-                    "Use when the user asks for: a Word document, .docx, "
-                    "business letter, report, memo, proposal, minutes, "
-                    "contract, or anything on company letterhead. NEVER "
-                    "fabricate a .docx yourself.\n\n"
-                    "Letterhead example:\n"
-                    "   ---\n"
-                    "   template: letter\n"
-                    "   letterhead: \"carta intestata.docx\"\n"
-                    "   title: Lettera commerciale\n"
-                    "   ---\n"
-                    "   # Oggetto\n"
-                    "   Body in Markdown...\n\n"
-                    "INPUT (auto-detected — prefer Markdown):\n"
-                    "1) Markdown with YAML frontmatter (preferred — fewer "
-                    "tokens than JSON, robust on long docs):\n"
-                    "   ---\n"
-                    "   template: report\n"
-                    "   title: FY 2024 Report\n"
-                    "   cover: auto\n"
-                    "   ---\n"
-                    "   # Executive summary\n"
-                    "   Revenue grew **24%** with margin up ==6 pp==.\n"
-                    "   ::: callout type=\"success\" title=\"Note\"\n"
-                    "   Highlight body.\n"
-                    "   :::\n"
-                    "2) JSON object (legacy, still supported) — see schema "
-                    "below.\n\n"
-                    "TEMPLATES (set in frontmatter `template:` or JSON "
-                    "`template`). Each ships a coherent design system "
-                    "(palette derived from `accent`, typographic + spacing "
-                    "scale, section rules under H1/H2):\n"
-                    "- report — numbered headings (1, 1.1, 1.1.1), editorial "
-                    "'rule' cover, footer 'N / M'. Add `[[toc]]` right after "
-                    "the cover.\n"
-                    "- whitepaper — long-form technical doc; numbered "
-                    "headings (depth 2), teal accent, 'rule' cover.\n"
-                    "- proposal — commercial proposal; bold accent 'band' "
-                    "cover, page numbers, NO heading numbers.\n"
-                    "- letter — business letter (30 mm margins, no page "
-                    "numbers, no section rules). Use `letter_fields:` or the "
-                    "`::: letter` fenced div.\n"
-                    "- memo — internal memo. Use `memo_fields:` (to, from, "
-                    "date, subject) or the `::: memo` fenced div.\n"
-                    "- minutes — meeting minutes (page numbers, green "
-                    "accent, section rules).\n"
-                    "- blank — base styling only, no default decoration.\n\n"
-                    "LETTERHEAD / SAMPLE (.docx or .dotx):\n"
-                    "Set frontmatter `letterhead: \"Filename.docx\"` "
-                    "(aliases: `sample`, `base_docx`; .dotx accepted). The tool "
-                    "resolves the file from the chat attachments first, then "
-                    "from the upload directories (/mnt/uploads and the "
-                    "OpenWebUI upload dir) — so a file attached in chat OR "
-                    "placed in /mnt/uploads both work; just pass its filename. "
-                    "The tool keeps that file's header, footer and margins and "
-                    "rewrites only the body. Do NOT read the letterhead with "
-                    "execute_code/python-docx; call this tool with `letterhead` "
-                    "set. Do not set `cover` with a letterhead. The filename "
-                    "matches by exact name, case-insensitive, or stem.\n\n"
-                    "COVER (frontmatter `cover:` map or JSON `cover`): fields "
-                    "`title/subtitle/author/date` (backfilled from the root), "
-                    "plus `kicker` (eyebrow label), `organization`, `logo` "
-                    "(b64/url/unsplash), and `style`: `rule` (editorial, "
-                    "default), `band` (title reversed on an accent panel), "
-                    "`banner` (hero image on top), `centered`.\n\n"
-                    "BRAND (client identity): frontmatter `brand: <preset>` "
-                    "(a name installed by the admin; an unknown name returns "
-                    "the list) or a map {name, logo, logo_header, primary, "
-                    "secondary, prepared_by}. `logo`: the file name of an "
-                    "image the user attached in chat, a path in the user's "
-                    "terminal, a URL or a data URI; omit it to use the image "
-                    "attached in chat. "
-                    "It colours the document and, on a template with a cover "
-                    "(report/proposal/whitepaper), draws a full-page branded "
-                    "cover plus a header with the logo and a footer 'Pag. X "
-                    "di Y'. Put the cover fields in `cover:`: `kicker` (type "
-                    "of document) and `meta` (a map of label: value, e.g. "
-                    "Committente, CIG, Importo; the date is added). `lang: "
-                    "it|en` sets the labels. Always fill `cover.kicker` "
-                    "(the type of document), `subtitle` and the `meta` fields "
-                    "you know (client, project, reference, author, version). "
-                    "Sections are `#` headings (not one `#` wrapping `##`), "
-                    "and do not put `---` between sections: headings already "
-                    "draw their rule.\n"
-                    "   ---\n"
-                    "   template: report\n"
-                    "   title: Analisi del disciplinare\n"
-                    "   brand: ianustec\n"
-                    "   cover:\n"
-                    "     kicker: Analisi di gara\n"
-                    "     meta:\n"
-                    "       Committente: Comune di X\n"
-                    "       CIG: \"AB12345678\"\n"
-                    "   ---\n\n"
-                    "HEADER/FOOTER: header supports `text`, `logo` and "
-                    "`show_page_numbers`; footer supports either `text` + "
-                    "`show_page_numbers`, or a 3-zone layout via `left`, "
-                    "`center`, `right` (use the literal `{page}` in a zone "
-                    "for the page number). When a cover exists the running "
-                    "header/footer is auto-suppressed on page 1.\n\n"
-                    "MARKDOWN SYNTAX (body):\n"
-                    "- Headings: `# H1`..`#### H4` (auto-numbered on report/"
-                    "whitepaper). Add an eyebrow with JSON `eyebrow`.\n"
-                    "- Paragraphs: inline `**bold**`, `*italic*`, "
-                    "`==accent==`, `` `code` ``, `[link](url)`\n"
-                    "- Lists: `-`/`*` (unordered), `1.` (ordered, restarts "
-                    "per list), nested via 2-space indent. Rendered COMPACT "
-                    "by default (blank lines between items do NOT add "
-                    "spacing).\n"
-                    "- Checklist: `- [ ] todo` / `- [x] done` (rendered with "
-                    "real ☐/☑ glyphs)\n"
-                    "- Tables: GFM `| h |\\n|--:|\\n| 12 |` — numeric columns "
-                    "auto right-align; header gets an accent underline; JSON "
-                    "adds `table_style` (lines|grid|minimal), `total_row`, "
-                    "`caption`\n"
-                    "- Code: fenced ```lang … ``` renders a monospace panel\n"
-                    "- KPI cards: `::: kpi\\nitems:\\n  - value: \\\"30%\\\"\\n"
-                    "    label: Saved\\n:::`\n"
-                    "- Columns: `::: columns\\ncolumns:\\n  - heading: A\\n"
-                    "    text: ...\\n  - heading: B\\n    text: ...\\n:::`\n"
-                    "- Definition list: `::: definition\\nitems:\\n  - term: X"
-                    "\\n    description: ...\\n:::`\n"
-                    "- Figure (numbered caption): `::: figure\\nsrc: "
-                    "unsplash:...\\ncaption: ...\\n:::`\n"
-                    "- Callouts: `::: callout type=\"info|success|warning"
-                    "|danger\" title=\"...\"\\nbody\\n:::` OR GitHub "
-                    "admonition `> [!note] Title\\n> body`\n"
-                    "- Quote: `> text` — Signature: `::: signature\\nName\\n"
-                    "Role\\n2026-04-18\\n:::`\n"
-                    "- Page break: `\\\\newpage` OR `::: page-break\\n:::` — "
-                    "TOC: `[[toc]]` OR `::: toc depth=\"3\"\\n:::` — "
-                    "Horizontal rule: `---`\n\n"
-                    "QUALITY RULES (both formats):\n"
-                    "- Set the template explicitly — A4 portrait is default.\n"
-                    "- Use real content, never placeholders like "
-                    "'Lorem ipsum'.\n"
-                    "- Reports/whitepapers: a cover + `[[toc]]`, short "
-                    "paragraphs, and a mix of headings, lists, tables, KPI "
-                    "cards and callouts. Lead a section with a `lead` "
-                    "paragraph (JSON `variant:\"lead\"`).\n"
-                    "- Tables: <= 6 columns; widths via `column_widths_pct` "
-                    "(JSON) or pipe alignment; set `total_row:true` for a "
-                    "highlighted totals row.\n"
-                    "- List spacing: lists are COMPACT by default — always "
-                    "prefer this, it looks clean. Only for a SHORT list that "
-                    "must fill a sparse page set JSON `spacing:\"relaxed\"` "
-                    "on that one list block. Never make long lists relaxed.\n"
-                    "- Images: `unsplash:` for stock (English, scene-based), "
-                    "`gen:` for AI (English, 10-30 words), "
-                    "`data:image/...;base64,...` for logos.\n"
-                    "- `==text==` maps to accent-colored runs."
-                ),
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "content": {
-                            "type": "string",
-                            "description": (
-                                "EITHER Markdown-with-frontmatter (preferred, "
-                                "see description) OR a JSON object with the "
-                                "shape:\n"
-                                "{\n"
-                                "  \"title\": \"...\",\n"
-                                "  \"subtitle\": \"...\",\n"
-                                "  \"author\": \"...\",\n"
-                                "  \"date\": \"YYYY-MM-DD\",\n"
-                                "  \"template\": \"blank|letter|report|memo"
-                                "|proposal|minutes|whitepaper\",\n"
-                                "  \"page\": {\"size\": \"a4\", "
-                                "\"orientation\": \"portrait\", "
-                                "\"margin_mm\": 25},\n"
-                                "  \"styles\": {\"font\": \"Calibri\", "
-                                "\"size_pt\": 11, \"accent\": \"#1E2761\", "
-                                "\"numbered_headings\": true, "
-                                "\"cover_style\": \"rule|band|banner\"},\n"
-                                "  \"header\": {\"text\": \"...\", "
-                                "\"logo\": \"data:image/png;base64,...\", "
-                                "\"show_page_numbers\": false},\n"
-                                "  \"footer\": {\"left\": \"Confidential\", "
-                                "\"center\": \"{page}\", \"right\": \"Org\"},\n"
-                                "  \"cover\": {\"style\": \"rule|band|banner\","
-                                " \"kicker\": \"...\", \"title\": \"...\", "
-                                "\"subtitle\": \"...\", \"author\": \"...\", "
-                                "\"organization\": \"...\", \"date\": \"...\", "
-                                "\"logo\": \"data:...\"},\n"
-                                "  \"letter_fields\": {\"sender\": {...}, "
-                                "\"recipient\": {...}, \"date\": \"...\", "
-                                "\"subject\": \"...\", \"closing\": \"...\"},\n"
-                                "  \"memo_fields\": {\"to\": \"...\", "
-                                "\"from\": \"...\", \"date\": \"...\", "
-                                "\"subject\": \"...\"},\n"
-                                "  \"blocks\": [\n"
-                                "    {\"type\": \"heading\", \"level\": 1, "
-                                "\"text\": \"...\", \"eyebrow\": \"...\"},\n"
-                                "    {\"type\": \"paragraph\", "
-                                "\"text\": \"...\", \"variant\": \"lead\"},\n"
-                                "    {\"type\": \"list\", \"list_style\": "
-                                "\"bullet|decimal|legal|checklist\", "
-                                "\"spacing\": \"compact|relaxed\", "
-                                "\"items\": [...]},\n"
-                                "    {\"type\": \"table\", \"table_style\": "
-                                "\"lines|grid|minimal\", \"total_row\": true, "
-                                "\"caption\": \"...\", \"headers\": [...], "
-                                "\"rows\": [[...]]},\n"
-                                "    {\"type\": \"kpi\", \"items\": "
-                                "[{\"value\": \"30%\", \"label\": \"...\"}]},\n"
-                                "    {\"type\": \"columns\", \"columns\": "
-                                "[{\"heading\": \"...\", \"text\": \"...\"}]},\n"
-                                "    {\"type\": \"definition\", \"items\": "
-                                "[{\"term\": \"...\", \"description\": "
-                                "\"...\"}]},\n"
-                                "    {\"type\": \"code\", \"language\": "
-                                "\"python\", \"code\": \"...\"},\n"
-                                "    {\"type\": \"figure\", \"image_hint\": "
-                                "\"...\", \"caption\": \"...\"},\n"
-                                "    {\"type\": \"callout\", \"kind\": "
-                                "\"info|success|warning|danger\", "
-                                "\"title\": \"...\", \"text\": \"...\"}\n"
-                                "  ]\n"
-                                "}\n\n"
-                                "Markdown is preferred for documents > 1 page; "
-                                "JSON is preferred only when the spec is "
-                                "highly structured (e.g. many tables with "
-                                "explicit `column_widths_pct`)."
-                            ),
-                        },
-                    },
-                    "required": ["content"],
-                },
-            },
-        }
 
 # endregion
 
